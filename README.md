@@ -82,10 +82,12 @@ with torch.no_grad():
     output = model(x)  # (1, 3, 256, 256) for scale=4
 ```
 
-### Inference Optimization
+### Weight Folding
 
 ```python
-# Fold ECB multi-branch convs into single 3x3 for faster inference
+# Fold ECB multi-branch convs into a single 3x3 conv to reduce model size
+# Note: folded weights cannot be used to resume training
+model.eval()
 model.fold_ecb()
 ```
 
