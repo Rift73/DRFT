@@ -98,6 +98,8 @@ model.fold_ecb()
 model.set_export_attention_mode(True)
 ```
 
+> **Performance note:** DRFT's efficiency gains are only realized in PyTorch with FlashAttention/SDPA. TensorRT does not support FlashAttention, so increasing the window size from 16x16 to 32x32 quadruples the attention cost (quadratic scaling) instead of the ~10% increase seen with FlashAttention in PyTorch. If targeting TensorRT deployment, consider using a smaller window size.
+
 ## Requirements
 
 - PyTorch >= 2.0
