@@ -93,35 +93,29 @@ model.fold_ecb()
 model.set_export_attention_mode(True)
 ```
 
-## Training Recommendations
-
-- Linear warmup: 5,000-10,000 iterations
-- Gradient clipping: `max_norm=1.0`
-- Weight decay: exclude bias and `bias_scale` parameters
-
-```python
-no_decay = ['bias', 'bias_scale']
-param_groups = [
-    {'params': [p for n, p in model.named_parameters()
-                if not any(nd in n for nd in no_decay)],
-     'weight_decay': 0.05},
-    {'params': [p for n, p in model.named_parameters()
-                if any(nd in n for nd in no_decay)],
-     'weight_decay': 0.0},
-]
-```
-
 ## Requirements
 
 - PyTorch >= 2.0
 - CUDA with FlashAttention/SDPA support (recommended)
 
-## Acknowledgments
+## Credits
 
-- [HAT](https://github.com/XPixelGroup/HAT) for the RHAG + OCAB paradigm
-- [DRCT](https://github.com/ming053l/DRCT) for dense skip connection design
-- [traiNNer-redux](https://github.com/the-database/traiNNer-redux) training framework
-- i-LN from "Analyzing the Training Dynamics of Image Restoration Transformers" (ICLR 2026)
+This architecture builds on ideas and components from the following works:
+
+| Component | Paper | Authors |
+|-----------|-------|---------|
+| RHAG + OCAB | [Activating More Pixels in Image Super-Resolution Transformer](https://arxiv.org/abs/2205.04437) (CVPR 2023) | Xiangyu Chen, Xintao Wang, Jiantao Zhou, Yu Qiao, Chao Dong |
+| Dense Skip Connections | [DRCT: Saving Image Super-Resolution away from Information Bottleneck](https://arxiv.org/abs/2404.00722) | Chih-Chung Hsu, Chia-Ming Lee, Yi-Shiuan Chou |
+| i-LN | [Analyzing the Training Dynamics of Image Restoration Transformers](https://openreview.net/forum?id=owziuM1nsR) (ICLR 2026) | Rui Qin, Ming Sun, Chao Zhou, Bin Wang |
+| Rank-Factored Bias | [FlashBias: Fast Computation of Attention with Bias](https://arxiv.org/abs/2505.12044) (NeurIPS 2025) | Zihao Zheng, Jingze Shi, Hanqiu Chen, Xiangyu Zhang, Zhe Li |
+| Shifted Window Attention | [SwinIR: Image Restoration Using Swin Transformer](https://arxiv.org/abs/2108.10257) (ICCVW 2021) | Jingyun Liang, Jiezhang Cao, Guolei Sun, Kai Zhang, Luc Van Gool, Radu Timofte |
+| ECB Reparameterizable Conv | [Edge-oriented Convolution Block for Real-time Super Resolution](https://github.com/xindongzhang/ECBSR) (ACM MM 2021) | Xindong Zhang, Hui Zeng, Lei Zhang |
+| ECA Channel Attention | [ECA-Net: Efficient Channel Attention](https://arxiv.org/abs/1910.03151) (CVPR 2020) | Qilong Wang, Banggu Wu, Pengfei Zhu, Peihua Li, Wangmeng Zuo, Qinghua Hu |
+| SwiGLU FFN | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) | Noam Shazeer |
+| LayerScale | [Going Deeper with Image Transformers](https://arxiv.org/abs/2103.17239) (ICCV 2021) | Hugo Touvron, Matthieu Cord, Alexandre Sablayrolles, Gabriel Synnaeve, Herve Jegou |
+| Pixel Attention | [Efficient Image Super-Resolution Using Pixel Attention](https://arxiv.org/abs/2010.01073) (ECCVW 2020) | Hengyuan Zhao, Xiangtao Kong, Jingwen He, Yu Qiao, Chao Dong |
+
+Trained with [traiNNer-redux](https://github.com/the-database/traiNNer-redux).
 
 ## License
 
