@@ -76,8 +76,9 @@ model = DRFT(
     rank=8,
 )
 
-# Inference
-x = torch.randn(1, 3, 64, 64)
+# Best performance with FP16 inference
+model = model.half().cuda()
+x = torch.randn(1, 3, 64, 64, device='cuda', dtype=torch.float16)
 with torch.no_grad():
     output = model(x)  # (1, 3, 256, 256) for scale=4
 ```
@@ -104,6 +105,12 @@ model.set_export_attention_mode(True)
 
 - PyTorch >= 2.0
 - CUDA with FlashAttention/SDPA support (recommended)
+
+## TODO
+
+- [ ] Upload pretrained model
+- [ ] Upload carefully optimized ONNX (mixed precision)
+- [ ] Gather benchmark data
 
 ## Credits
 
