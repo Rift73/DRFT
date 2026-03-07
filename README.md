@@ -32,9 +32,12 @@ Preliminary results with DRFT-L at 706K/800K training iterations (training in pr
 |--------|:-:|:-:|:-:|:-:|
 | SwinIR | 27.45 | 0.8254 | 32.03 | 0.9260 |
 | DAT | 27.87 | 0.8343 | 32.51 | 0.9291 |
-| HAT-L | 28.93 | 0.8547 | 33.28 | 0.9348 |
+| HAT-L | 28.60 | 0.8498 | 33.09 | 0.9335 |
+| HAT-L* | 28.93 | 0.8547 | 33.28 | 0.9348 |
 | DRCT-L | 28.70 | 0.8508 | 33.14 | 0.9347 |
-| **DRFT-L** (706K/800K) | **29.15** | **0.8602** | 32.27 | **0.9351** |
+| **DRFT-L*** (706K/800K) | **29.15** | **0.8602** | 32.27 | **0.9351** |
+
+\* Trained on the same enhanced dataset.
 
 > Note: Results are preliminary. Training has not yet converged (706K of 800K iterations).
 
