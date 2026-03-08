@@ -132,7 +132,9 @@ def _scaled_dot_product_attention_export_safe(
     """SDPA wrapper with math-attention fallback for ONNX/TensorRT export.
 
     The fallback path avoids emitting ONNX Attention op by using explicit
-    matmul/softmax/matmul in FP32 accumulation, then casts back to value dtype.
+    matmul/softmax/matmul. Matmuls stay in input dtype (BF16 tensor cores)
+    while only softmax is upcast to FP32 for accumulation stability.
+    Pre-softmax clamping prevents exp() overflow in reduced precision.
     """
     if not use_export_safe_math:
         return F.scaled_dot_product_attention(
@@ -144,20 +146,23 @@ def _scaled_dot_product_attention_export_safe(
             scale=scale,
         )
 
-    q_fp32 = q.float()
-    k_fp32 = k.float()
-    v_fp32 = v.float()
-
-    attn = torch.matmul(q_fp32, k_fp32.transpose(-2, -1))
+    # Q@K^T matmul stays in input dtype (BF16 tensor cores when available)
+    attn = torch.matmul(q, k.transpose(-2, -1))
     if scale is not None:
         attn = attn * scale
     if attn_mask is not None:
         attn = attn + attn_mask.to(dtype=attn.dtype)
-    attn = torch.softmax(attn, dim=-1)
+    # Pre-softmax clamp: prevents exp() overflow in BF16/FP16.
+    # exp(50) ≈ 5.2e21 is safely within BF16 range (max 3.4e38).
+    # Region mask -inf is clamped to -50: exp(-50) ≈ 0 — masking preserved.
+    attn = attn.clamp(-50.0, 50.0)
+    # Only softmax needs FP32 (accumulation over N tokens loses precision in BF16)
+    attn = torch.softmax(attn.float(), dim=-1).to(dtype=v.dtype)
     if dropout_p > 0.0 and training:
         attn = F.dropout(attn, p=dropout_p, training=True)
-    out = torch.matmul(attn, v_fp32)
-    return out.to(dtype=v.dtype)
+    # A@V matmul stays in input dtype
+    out = torch.matmul(attn, v)
+    return out
 
 
 def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
@@ -356,24 +361,27 @@ class iLN(nn.Module):
                 - normalized_output: (B, L, C) normalized and affine-transformed
                 - std: (B, 1, 1) residual scale for input-adaptive rescaling
         """
-        # Compute LN* stats over BOTH spatial and channel axes in one reduction.
-        var, mean = torch.var_mean(x, dim=(1, 2), keepdim=True, correction=0)
+        # Compute LN* stats in FP32 for BF16/FP16 stability.
+        # var_mean over (L*C) can be 10000+ elements — BF16 mantissa too narrow.
+        orig_dtype = x.dtype
+        x_fp32 = x.float()
+        var, mean = torch.var_mean(x_fp32, dim=(1, 2), keepdim=True, correction=0)
         std_raw = torch.sqrt(var + self.eps)  # (B, 1, 1)
 
-        # Normalize with raw std from LN* (paper-faithful normalization path).
-        x_norm = (x - mean) / std_raw
+        # Normalize in FP32 (paper-faithful normalization path).
+        x_norm = (x_fp32 - mean) / std_raw
 
-        # Apply learnable affine transformation.
-        w = self.weight.view(1, 1, -1).to(x.dtype)
-        b = self.bias.view(1, 1, -1).to(x.dtype)
-        out = w * x_norm + b
+        # Apply learnable affine transformation, cast output back.
+        w = self.weight.view(1, 1, -1).float()
+        b = self.bias.view(1, 1, -1).float()
+        out = (w * x_norm + b).to(orig_dtype)
 
         # Stabilized residual scale:
         # - detach removes gradient feedback through scale
         # - alpha<1 compresses high-variance updates
         # - upper clamp prevents rare exploding updates
         scale = (std_raw.detach() + self.eps).pow(self.scale_alpha)
-        scale = scale.clamp(max=self.scale_max).to(x.dtype)
+        scale = scale.clamp(max=self.scale_max).to(orig_dtype)
 
         # Caller applies residual as: x + scale * f(out)
         return out, scale
@@ -957,17 +965,26 @@ class ACTBlock(nn.Module):
 
             # Process each group sequentially: gather -> attn -> scatter -> free,
             # so both temporary outputs are never alive at the same time.
+            # Guard empty index groups and align dtypes for index_put under AMP/BF16.
             attn_windows = torch.empty_like(x_windows)
 
             # Interior windows: Flash path (no mask needed)
-            interior_windows = x_windows[int_idx_full]
-            attn_windows[int_idx_full] = self.attn(interior_windows)
-            del interior_windows
+            if int_idx_full.numel() > 0:
+                interior_windows = x_windows[int_idx_full]
+                interior_out = self.attn(interior_windows)
+                if interior_out.dtype != attn_windows.dtype:
+                    interior_out = interior_out.to(dtype=attn_windows.dtype)
+                attn_windows[int_idx_full] = interior_out
+                del interior_windows, interior_out
 
             # Boundary windows: masked SDPA or Flex (with region mask)
-            boundary_windows = x_windows[bnd_idx_full]
-            attn_windows[bnd_idx_full] = self.attn(boundary_windows, mask=region_mask)
-            del boundary_windows
+            if bnd_idx_full.numel() > 0:
+                boundary_windows = x_windows[bnd_idx_full]
+                boundary_out = self.attn(boundary_windows, mask=region_mask)
+                if boundary_out.dtype != attn_windows.dtype:
+                    boundary_out = boundary_out.to(dtype=attn_windows.dtype)
+                attn_windows[bnd_idx_full] = boundary_out
+                del boundary_windows, boundary_out
         else:
             attn_windows = self.attn(x_windows)
 
