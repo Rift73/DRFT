@@ -64,6 +64,7 @@ Example optimizer setup:
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Literal, Optional
 
@@ -71,6 +72,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+
+# Flex Attention (hybrid mode only — requires Triton, Linux)
+try:
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+    _FLEX_AVAILABLE = True
+except ImportError:
+    _FLEX_AVAILABLE = False
+
+ATTN_TYPE = Literal['masked', 'hybrid']
 
 # =============================================================================
 # Utility Functions
@@ -148,6 +158,29 @@ def _scaled_dot_product_attention_export_safe(
         attn = F.dropout(attn, p=dropout_p, training=True)
     out = torch.matmul(attn, v_fp32)
     return out.to(dtype=v.dtype)
+
+
+def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
+    """Create a score_mod for flex_attention that adds rank-factored neural bias.
+
+    Uses flattened 2D indexing (num_heads, seq_len*seq_len) to avoid 3D fancy
+    indexing which causes SubgraphLoweringException in torch.compile's inductor.
+    This matches ESCReal's apply_rpe pattern: table[h, computed_flat_idx].
+
+    Created fresh each forward pass with the current-device bias tensor.
+    Dynamo detects the closure structure is identical across calls and treats
+    the captured tensor as a graph input — no recompilation overhead.
+    """
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score + bias_flat[h, q_idx * seq_len + kv_idx]
+    return score_mod
+
+
+# Single compiled flex_attention handle shared by all WindowAttentionRFB instances.
+# Dynamo's code cache means all call sites reuse the same Triton kernel after the
+# first compilation, so per-instance compilation is redundant overhead.
+if _FLEX_AVAILABLE:
+    _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
 
 
 class DropPath(nn.Module):
@@ -683,9 +716,9 @@ class ConvSwiGLUFFN(nn.Module):
 class WindowAttentionRFB(nn.Module):
     """Window attention with rank-factored neural bias (Flash-friendly).
 
-    Injects position information via Q/K concatenation with learned bias
-    factors, keeping attention compatible with Flash/SDPA backends.
-    Uses fused QKV projection and V-padding for uniform head dimensions.
+    Supports two attention modes (both use Flash for interior/non-shifted windows):
+    - masked: Boundary windows use SDPA with dense attn_mask (portable, no Triton)
+    - hybrid: Boundary windows use Flex Attention with BlockMask (requires Triton)
     """
 
     def __init__(
@@ -697,6 +730,7 @@ class WindowAttentionRFB(nn.Module):
         attn_drop: float = 0.,
         proj_drop: float = 0.,
         rank: int = 8,
+        attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -704,6 +738,7 @@ class WindowAttentionRFB(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.rank = rank
+        self.attn_type = attn_type
 
         assert self.head_dim % 8 == 0, (
             f"head_dim should be divisible by 8 for SDPA optimization, got {self.head_dim}"
@@ -726,7 +761,11 @@ class WindowAttentionRFB(nn.Module):
             rank=rank,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Hybrid (Flex Attention) setup — Flex needs ws² for flattened bias indexing
+        if attn_type == 'hybrid':
+            self._ws_sq = window_size[0] * window_size[1]
+
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         b_windows, n_tokens, c = x.shape
 
         qkv = self.qkv(x).reshape(b_windows, n_tokens, 3, self.num_heads, self.head_dim)
@@ -734,27 +773,60 @@ class WindowAttentionRFB(nn.Module):
         q, k, v = qkv.unbind(0)
 
         bq, bk = self.neural_bias()
-        bq = bq.unsqueeze(0).to(dtype=q.dtype).expand(b_windows, -1, -1, -1)
-        bk = bk.unsqueeze(0).to(dtype=k.dtype).expand(b_windows, -1, -1, -1)
 
-        q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
-        k_aug = torch.cat([k, bk], dim=-1)
-        # Flash SDP in PyTorch requires q/k/v to share the same head dim.
-        # Pad V with zeros to (head_dim + rank), run attention, then crop back.
-        v_aug = F.pad(v, (0, self.rank))
+        if self.attn_type == 'hybrid' and mask is not None:
+            # Flex Attention path: bias via score_mod, region mask via BlockMask.
+            # Only used for boundary windows in shifted blocks (requires Triton).
+            bias_flat = torch.einsum('hnr,hmr->hnm', bq, bk).reshape(
+                bq.shape[0], -1,
+            )
+            score_mod = _make_bias_score_mod(bias_flat, self._ws_sq)
+            out = _compiled_flex_attention(
+                q, k, v,
+                score_mod=score_mod,
+                block_mask=mask,
+                scale=self.content_scale,
+            )
+        elif self.attn_type == 'masked' and mask is not None:
+            # SDPA path: bias + region mask → dense attn_mask.
+            # Used for boundary windows in shifted blocks (portable, no Triton).
+            # Standard Q/K/V with explicit bias — no augmentation or V padding.
+            bias = torch.einsum('hnr,hmr->hnm', bq, bk)  # (num_heads, ws², ws²)
+            attn_mask = bias.unsqueeze(0) + mask.to(dtype=bias.dtype)  # (B_bnd, num_heads, ws², ws²)
+            use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
+            out = _scaled_dot_product_attention_export_safe(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop_p,
+                scale=self.content_scale,
+                training=self.training,
+                use_export_safe_math=use_export_safe_math,
+            )
+        else:
+            # Flash path: bias via Q/K concatenation, no mask needed.
+            # Used for non-shifted windows and interior shifted windows
+            # in both modes (they have no cross-window contamination risk).
+            bq = bq.unsqueeze(0).to(dtype=q.dtype).expand(b_windows, -1, -1, -1)
+            bk = bk.unsqueeze(0).to(dtype=k.dtype).expand(b_windows, -1, -1, -1)
 
-        use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
-        out = _scaled_dot_product_attention_export_safe(
-            q_aug,
-            k_aug,
-            v_aug,
-            attn_mask=None,
-            dropout_p=self.attn_drop_p,
-            scale=1.0,
-            training=self.training,
-            use_export_safe_math=use_export_safe_math,
-        )
-        out = out[..., : self.head_dim]
+            q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
+            k_aug = torch.cat([k, bk], dim=-1)
+            # Flash SDP in PyTorch requires q/k/v to share the same head dim.
+            # Pad V with zeros to (head_dim + rank), run attention, then crop back.
+            v_aug = F.pad(v, (0, self.rank))
+
+            use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
+            out = _scaled_dot_product_attention_export_safe(
+                q_aug,
+                k_aug,
+                v_aug,
+                attn_mask=None,
+                dropout_p=self.attn_drop_p,
+                scale=1.0,
+                training=self.training,
+                use_export_safe_math=use_export_safe_math,
+            )
+            out = out[..., : self.head_dim]
 
         out = out.transpose(1, 2).reshape(b_windows, n_tokens, c)
         out = self.proj(out)
@@ -794,6 +866,7 @@ class ACTBlock(nn.Module):
         layer_scale_init: float = 1e-6,
         rank: int = 8,
         use_iln: bool = False,
+        attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -823,6 +896,7 @@ class ACTBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=drop,
             rank=rank,
+            attn_type=attn_type,
         )
 
         # ECB Conv block with ECA
@@ -844,7 +918,7 @@ class ACTBlock(nn.Module):
         self.norm2 = iLN(dim) if use_iln else nn.LayerNorm(dim)
         self.ffn = ConvSwiGLUFFN(dim=dim, expansion_factor=mlp_ratio, drop=drop)
 
-    def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_size: tuple[int, int], hybrid_ctx=None) -> torch.Tensor:
         H, W = x_size
         B, L, C = x.shape
 
@@ -873,8 +947,29 @@ class ACTBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)  # (nW*B, ws, ws, C)
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
 
-        # Window attention
-        attn_windows = self.attn(x_windows)
+        # Window attention with per-window routing for shifted blocks.
+        # Non-shifted blocks: all windows → Flash path (no contamination risk).
+        # Shifted blocks: interior windows → Flash, boundary windows → masked/Flex.
+        # int_idx_full/bnd_idx_full are pre-expanded batch indices cached at
+        # model level — no per-block recomputation needed.
+        if self.shift_size > 0 and hybrid_ctx is not None:
+            region_mask, int_idx_full, bnd_idx_full = hybrid_ctx
+
+            # Process each group sequentially: gather -> attn -> scatter -> free,
+            # so both temporary outputs are never alive at the same time.
+            attn_windows = torch.empty_like(x_windows)
+
+            # Interior windows: Flash path (no mask needed)
+            interior_windows = x_windows[int_idx_full]
+            attn_windows[int_idx_full] = self.attn(interior_windows)
+            del interior_windows
+
+            # Boundary windows: masked SDPA or Flex (with region mask)
+            boundary_windows = x_windows[bnd_idx_full]
+            attn_windows[bnd_idx_full] = self.attn(boundary_windows, mask=region_mask)
+            del boundary_windows
+        else:
+            attn_windows = self.attn(x_windows)
 
         # Merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -1141,6 +1236,7 @@ class AttentionBlocks(nn.Module):
         dense_skip: bool = True,
         rank: int = 8,
         use_iln: bool = False,
+        attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -1172,6 +1268,7 @@ class AttentionBlocks(nn.Module):
                 layer_scale_init=layer_scale_init,
                 rank=rank,
                 use_iln=use_iln,
+                attn_type=attn_type,
             )
             for i in range(depth)
         ])
@@ -1195,19 +1292,20 @@ class AttentionBlocks(nn.Module):
             self.dense_fusion = nn.Linear(dim * depth, dim)
             self.ls_dense = LayerScale(dim, init_value=1e-4)
 
-    def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_size: tuple[int, int], hybrid_ctx=None) -> torch.Tensor:
         if self.dense_skip:
             # Collect outputs from all blocks
             block_outputs = []
             for blk in self.blocks:
                 if self.use_checkpoint_act and self.training:
-                    x = checkpoint(blk, x, x_size, use_reentrant=False)
+                    x = checkpoint(blk, x, x_size, hybrid_ctx, use_reentrant=False)
                 else:
-                    x = blk(x, x_size)
+                    x = blk(x, x_size, hybrid_ctx)
                 block_outputs.append(x)
 
             # OCAB on final sequential output BEFORE dense fusion
             # This ensures cross-window attention operates on refined sequential features
+            # OCAB does not use shifted windows — no block_mask needed
             if self.use_checkpoint_ocab and self.training:
                 x = checkpoint(self.ocab, x, x_size, use_reentrant=False)
             else:
@@ -1220,11 +1318,11 @@ class AttentionBlocks(nn.Module):
         else:
             for blk in self.blocks:
                 if self.use_checkpoint_act and self.training:
-                    x = checkpoint(blk, x, x_size, use_reentrant=False)
+                    x = checkpoint(blk, x, x_size, hybrid_ctx, use_reentrant=False)
                 else:
-                    x = blk(x, x_size)
+                    x = blk(x, x_size, hybrid_ctx)
 
-            # OCAB
+            # OCAB — no block_mask needed (no shifted windows)
             if self.use_checkpoint_ocab and self.training:
                 x = checkpoint(self.ocab, x, x_size, use_reentrant=False)
             else:
@@ -1266,6 +1364,7 @@ class RHAG(nn.Module):
         resi_connection: str = '1conv',
         rank: int = 8,
         use_iln: bool = False,
+        attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -1290,6 +1389,7 @@ class RHAG(nn.Module):
             dense_skip=dense_skip,
             rank=rank,
             use_iln=use_iln,
+            attn_type=attn_type,
         )
         
         # Residual connection conv
@@ -1306,12 +1406,12 @@ class RHAG(nn.Module):
         else:
             self.conv = nn.Identity()
 
-    def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_size: tuple[int, int], hybrid_ctx=None) -> torch.Tensor:
         # x: (B, L, C)
         H, W = x_size
-        
+
         # Attention blocks
-        res = self.residual_group(x, x_size)
+        res = self.residual_group(x, x_size, hybrid_ctx)
         
         # Conv on residual
         res = res.transpose(1, 2).view(-1, self.dim, H, W)
@@ -1490,17 +1590,32 @@ class DRFT(nn.Module):
         num_feat: int = 64,
         rank: int = 8,
         use_iln: bool = False,
+        attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
-        
+
         # Validate head_dim constraint (divisible by 8 for tensor core efficiency)
         assert embed_dim % num_heads[0] == 0, "embed_dim must be divisible by num_heads"
         head_dim = embed_dim // num_heads[0]
         assert head_dim % 8 == 0, f"head_dim should be divisible by 8 for SDPA optimization, got {head_dim}"
-        
+
+        # Validate hybrid mode requirements (Flex Attention needs Triton)
+        if attn_type == 'hybrid':
+            if not _FLEX_AVAILABLE:
+                raise ImportError(
+                    "DRFT with attn_type='hybrid' requires torch.nn.attention.flex_attention "
+                    "(Triton + Linux). Use attn_type='masked' for portable masked attention."
+                )
+            from traiNNer.utils.misc import require_triton
+            require_triton(
+                "DRFT with attn_type='hybrid' requires Triton for Flex Attention. "
+                "Use attn_type='masked' for portable masked attention."
+            )
+
         self.img_range = img_range
         self.upscale = upscale
         self.window_size = window_size
+        self.attn_type = attn_type
         
         # Image mean for normalization (RGB mean from ImageNet)
         if in_chans == 3:
@@ -1551,6 +1666,7 @@ class DRFT(nn.Module):
                 resi_connection=resi_connection,
                 rank=rank,
                 use_iln=stage_use_iln,
+                attn_type=attn_type,
             )
             self.layers.append(layer)
 
@@ -1580,6 +1696,236 @@ class DRFT(nn.Module):
         # Persistent flag for spandrel/chaiNNer auto-detection
         self.register_buffer('_use_iln', torch.tensor(use_iln), persistent=True)
 
+        # Per-window routing caches (masked and hybrid modes)
+        if attn_type in ('masked', 'hybrid'):
+            self._region_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+            self._window_indices_cache: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+            self._batch_indices_cache: OrderedDict[tuple, tuple[torch.Tensor, torch.Tensor]] = OrderedDict()
+            self._mask_cache_max = 8
+        # Mode-specific mask caches
+        if attn_type == 'masked':
+            self._dense_mask_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
+        elif attn_type == 'hybrid':
+            self._block_mask_cache: OrderedDict[tuple, object] = OrderedDict()
+
+    def _compute_region_ids(self, H: int, W: int, device: torch.device) -> torch.Tensor:
+        """Compute Swin-style region IDs for shifted window masking.
+
+        Each token within a shifted window is assigned a region ID (0-8)
+        indicating which original (pre-roll) window it came from.
+        Tokens with different region IDs should not attend to each other.
+
+        Returns:
+            region_ids: (nW, ws²) long tensor
+        """
+        ws = self.window_size
+        shift = ws // 2
+
+        img_mask = torch.zeros((1, H, W, 1), device=device)
+        h_slices = (
+            slice(0, -ws),
+            slice(-ws, -shift),
+            slice(-shift, None),
+        )
+        w_slices = (
+            slice(0, -ws),
+            slice(-ws, -shift),
+            slice(-shift, None),
+        )
+
+        cnt = 0
+        for h in h_slices:
+            for w in w_slices:
+                img_mask[:, h, w, :] = cnt
+                cnt += 1
+
+        mask_windows = window_partition(img_mask, ws)  # (nW, ws, ws, 1)
+        region_ids = mask_windows.view(-1, ws * ws).long()  # (nW, ws²)
+        return region_ids
+
+    def _get_window_indices(
+        self, H: int, W: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get cached (interior_indices, boundary_indices) for per-window routing.
+
+        After cyclic shift, windows form an (nH, nW) grid. Interior windows
+        (row < nH-1 and col < nW-1) are entirely within region 0 and need no
+        masking — they can use Flash. Boundary windows (last row or last col)
+        straddle region boundaries and require Flex with a block_mask.
+
+        Returns:
+            (interior_indices, boundary_indices): 1D long tensors indexing into
+            the flattened window dimension (size nW = nH_grid * nW_grid).
+        """
+        idx_key = (H, W, device)
+        if idx_key not in self._window_indices_cache:
+            ws = self.window_size
+            nH_grid = H // ws
+            nW_grid = W // ws
+
+            interior = []
+            boundary = []
+            for i in range(nH_grid):
+                for j in range(nW_grid):
+                    w = i * nW_grid + j
+                    if i < nH_grid - 1 and j < nW_grid - 1:
+                        interior.append(w)
+                    else:
+                        boundary.append(w)
+
+            self._window_indices_cache[idx_key] = (
+                torch.tensor(interior, dtype=torch.long, device=device),
+                torch.tensor(boundary, dtype=torch.long, device=device),
+            )
+            if len(self._window_indices_cache) > self._mask_cache_max:
+                self._window_indices_cache.popitem(last=False)
+        else:
+            self._window_indices_cache.move_to_end(idx_key)
+
+        return self._window_indices_cache[idx_key]
+
+    def _get_batch_indices(
+        self, B: int, H: int, W: int, device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get cached per-batch expanded indices for gather/scatter routing.
+
+        Expands the per-window interior/boundary indices across the batch
+        dimension. For x_windows shaped (B*nW, ws², C), these index the
+        correct rows for each batch element's interior/boundary windows.
+
+        Returns:
+            (int_idx_full, bnd_idx_full): 1D long tensors of size
+            (B * n_interior,) and (B * n_boundary,) respectively.
+        """
+        cache_key = (B, H, W, device)
+        if cache_key not in self._batch_indices_cache:
+            interior_idx, boundary_idx = self._get_window_indices(H, W, device)
+            ws = self.window_size
+            nW = (H // ws) * (W // ws)
+
+            offsets = torch.arange(B, device=device).unsqueeze(1) * nW
+            int_idx_full = (offsets + interior_idx.unsqueeze(0)).reshape(-1)
+            bnd_idx_full = (offsets + boundary_idx.unsqueeze(0)).reshape(-1)
+
+            self._batch_indices_cache[cache_key] = (int_idx_full, bnd_idx_full)
+            if len(self._batch_indices_cache) > self._mask_cache_max:
+                self._batch_indices_cache.popitem(last=False)
+        else:
+            self._batch_indices_cache.move_to_end(cache_key)
+
+        return self._batch_indices_cache[cache_key]
+
+    def _get_shifted_dense_mask(
+        self, B: int, H: int, W: int, device: torch.device,
+    ) -> torch.Tensor:
+        """Get or create cached dense region mask for boundary windows.
+
+        Builds a float mask from region IDs: 0 for same-region token pairs
+        (can attend), -inf for different-region pairs (must not attend).
+        The mask is pre-expanded across the batch dimension for direct use
+        in SDPA's attn_mask parameter.
+
+        Args:
+            B: Batch size (number of images)
+            H, W: Spatial dimensions (after padding to window_size multiple)
+            device: Target device
+
+        Returns:
+            Dense mask of shape (B * n_boundary, 1, ws², ws²) with values
+            0.0 (same region) or -inf (different region).
+        """
+        mask_key = (B, H, W, device)
+        if mask_key not in self._dense_mask_cache:
+            ws = self.window_size
+
+            # Get cached region IDs
+            region_key = (H, W, device)
+            if region_key not in self._region_cache:
+                self._region_cache[region_key] = self._compute_region_ids(H, W, device)
+                if len(self._region_cache) > self._mask_cache_max:
+                    self._region_cache.popitem(last=False)
+            else:
+                self._region_cache.move_to_end(region_key)
+            region_ids = self._region_cache[region_key]  # (nW, ws²)
+
+            # Extract boundary window region IDs
+            _, boundary_idx = self._get_window_indices(H, W, device)
+            boundary_regions = region_ids[boundary_idx]  # (n_boundary, ws²)
+
+            # Build mask: same region → 0, different region → -inf
+            # (n_boundary, ws², 1) vs (n_boundary, 1, ws²) → (n_boundary, ws², ws²)
+            same_region = boundary_regions.unsqueeze(2) == boundary_regions.unsqueeze(1)
+            mask = torch.zeros(same_region.shape, dtype=torch.float32, device=device)
+            mask.masked_fill_(~same_region, float('-inf'))
+
+            # (n_boundary, 1, ws², ws²) — head dim broadcasts across all heads.
+            # .repeat(B, ...) tiles for batch: layout matches x_windows gather order.
+            mask = mask.unsqueeze(1).repeat(B, 1, 1, 1)
+
+            self._dense_mask_cache[mask_key] = mask
+            if len(self._dense_mask_cache) > self._mask_cache_max:
+                self._dense_mask_cache.popitem(last=False)
+        else:
+            self._dense_mask_cache.move_to_end(mask_key)
+
+        return self._dense_mask_cache[mask_key]
+
+    def _get_shifted_block_mask(
+        self, B: int, H: int, W: int, device: torch.device,
+    ) -> BlockMask:
+        """Get or create cached BlockMask for boundary windows only.
+
+        Only boundary windows (last row/col of the window grid) have mixed
+        region IDs and need masking. Interior windows use Flash instead.
+
+        Args:
+            B: Batch size (number of images)
+            H, W: Spatial dimensions (after padding to window_size multiple)
+            device: Target device
+
+        Returns:
+            BlockMask sized for boundary windows only (B * n_boundary batches)
+        """
+        ws = self.window_size
+        nH_grid = H // ws
+        nW_grid = W // ws
+        nW = nH_grid * nW_grid
+
+        # Get cached region IDs (for ALL windows)
+        region_key = (H, W, device)
+        if region_key not in self._region_cache:
+            self._region_cache[region_key] = self._compute_region_ids(H, W, device)
+            if len(self._region_cache) > self._mask_cache_max:
+                self._region_cache.popitem(last=False)
+        else:
+            self._region_cache.move_to_end(region_key)
+        region_ids = self._region_cache[region_key]  # (nW, ws²)
+
+        # Extract boundary window indices and their region IDs
+        _, boundary_idx = self._get_window_indices(H, W, device)
+        n_boundary = len(boundary_idx)
+        boundary_region_ids = region_ids[boundary_idx]  # (n_boundary, ws²)
+
+        # Get cached BlockMask for boundary windows
+        mask_key = (B, H, W, device)
+        if mask_key not in self._block_mask_cache:
+            B_total = B * n_boundary
+            ws_sq = ws * ws
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                win_idx = b % n_boundary
+                return boundary_region_ids[win_idx, q_idx] == boundary_region_ids[win_idx, kv_idx]
+
+            self._block_mask_cache[mask_key] = create_block_mask(
+                mask_mod, B_total, 1, ws_sq, ws_sq, device=device,
+            )
+            if len(self._block_mask_cache) > self._mask_cache_max:
+                self._block_mask_cache.popitem(last=False)
+        else:
+            self._block_mask_cache.move_to_end(mask_key)
+
+        return self._block_mask_cache[mask_key]
+
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):
             trunc_normal_(m.weight, std=.02)
@@ -1596,18 +1942,37 @@ class DRFT(nn.Module):
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x_size = (x.shape[2], x.shape[3])
+        H, W = x_size
+
+        # Compute per-window routing info for shifted ACTBlocks.
+        # hybrid_ctx = (region_mask, int_idx_full, bnd_idx_full) passed through
+        # the layer hierarchy. Non-shifted blocks ignore it entirely and use
+        # Flash. Shifted blocks split windows: interior → Flash, boundary → masked/Flex.
+        # Both mask types and batch indices are cached at model level.
+        if self.attn_type == 'masked':
+            B = x.shape[0]
+            dense_mask = self._get_shifted_dense_mask(B, H, W, x.device)
+            int_idx_full, bnd_idx_full = self._get_batch_indices(B, H, W, x.device)
+            hybrid_ctx = (dense_mask, int_idx_full, bnd_idx_full)
+        elif self.attn_type == 'hybrid':
+            B = x.shape[0]
+            block_mask = self._get_shifted_block_mask(B, H, W, x.device)
+            int_idx_full, bnd_idx_full = self._get_batch_indices(B, H, W, x.device)
+            hybrid_ctx = (block_mask, int_idx_full, bnd_idx_full)
+        else:
+            hybrid_ctx = None
 
         # Patch embedding
         x = self.patch_embed(x)
 
         # RHAG layers
         for layer in self.layers:
-            x = layer(x, x_size)
+            x = layer(x, x_size, hybrid_ctx)
 
         # Final norm
         x = self.norm(x)
         x = self.patch_unembed(x, x_size)
-        
+
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1676,6 +2041,7 @@ def drft_xs(
     use_checkpoint: bool = False,
     window_size: int = 32,
     drop_path_rate: float = 0.1,
+    attn_type: ATTN_TYPE = 'masked',
     **kwargs
 ) -> DRFT:
     """DRFT-Extra-Small: embed_dim=128, 4 RHAG layers, 4 heads."""
@@ -1690,6 +2056,7 @@ def drft_xs(
         drop_path_rate=drop_path_rate,
         use_checkpoint=use_checkpoint,
         dense_skip=True,
+        attn_type=attn_type,
         **kwargs
     )
 
@@ -1699,6 +2066,7 @@ def drft_s(
     use_checkpoint: bool = False,
     window_size: int = 32,
     drop_path_rate: float = 0.1,
+    attn_type: ATTN_TYPE = 'masked',
     **kwargs
 ) -> DRFT:
     """DRFT-Small: embed_dim=160, 6 RHAG layers, 5 heads."""
@@ -1713,6 +2081,7 @@ def drft_s(
         drop_path_rate=drop_path_rate,
         use_checkpoint=use_checkpoint,
         dense_skip=True,
+        attn_type=attn_type,
         **kwargs
     )
 
@@ -1722,6 +2091,7 @@ def drft_m(
     use_checkpoint: bool = False,
     window_size: int = 32,
     drop_path_rate: float = 0.1,
+    attn_type: ATTN_TYPE = 'masked',
     **kwargs
 ) -> DRFT:
     """DRFT-Medium: embed_dim=192, 6 RHAG layers, 6 heads."""
@@ -1736,6 +2106,7 @@ def drft_m(
         drop_path_rate=drop_path_rate,
         use_checkpoint=use_checkpoint,
         dense_skip=True,
+        attn_type=attn_type,
         **kwargs
     )
 
@@ -1745,6 +2116,7 @@ def drft_l(
     use_checkpoint: bool = False,
     window_size: int = 32,
     drop_path_rate: float = 0.1,
+    attn_type: ATTN_TYPE = 'masked',
     **kwargs
 ) -> DRFT:
     """DRFT-Large: embed_dim=192, 12 RHAG layers, 6 heads."""
@@ -1759,6 +2131,7 @@ def drft_l(
         drop_path_rate=drop_path_rate,
         use_checkpoint=use_checkpoint,
         dense_skip=True,
+        attn_type=attn_type,
         **kwargs
     )
 
@@ -1837,14 +2210,41 @@ def check_ddp_compatibility(model: nn.Module, device: str = 'cuda') -> bool:
 if __name__ == '__main__':
     # Quick sanity check
     print("DRFT Architecture Definitions:")
-    print(f"  drft_xs: embed_dim=128, 4 layers, heads=4, head_dim=32 ✓")
-    print(f"  drft_s:  embed_dim=160, 6 layers, heads=5, head_dim=32 ✓")
-    print(f"  drft_m:  embed_dim=192, 6 layers, heads=6, head_dim=32 ✓")
-    print(f"  drft_l:  embed_dim=192, 12 layers, heads=6, head_dim=32 ✓")
+    print(f"  drft_xs: embed_dim=128, 4 layers, heads=4, head_dim=32")
+    print(f"  drft_s:  embed_dim=160, 6 layers, heads=5, head_dim=32")
+    print(f"  drft_m:  embed_dim=192, 6 layers, heads=6, head_dim=32")
+    print(f"  drft_l:  embed_dim=192, 12 layers, heads=6, head_dim=32")
     print("\nAll models satisfy Flash constraints (head_dim=32, rank=8 => 40)")
 
     # Run DDP check if CUDA available
     if torch.cuda.is_available():
-        print("\nRunning DDP compatibility check...")
-        model = drft_xs(scale=4)
-        check_ddp_compatibility(model)
+        print("\nRunning DDP compatibility check (masked mode)...")
+        model_masked = drft_xs(scale=4, attn_type='masked')
+        check_ddp_compatibility(model_masked)
+
+        if _FLEX_AVAILABLE:
+            print("\nRunning DDP compatibility check (hybrid mode)...")
+            model_hybrid = drft_xs(scale=4, attn_type='hybrid')
+            check_ddp_compatibility(model_hybrid)
+
+            # Verify output shapes match between modes
+            print("\nVerifying masked/hybrid output shape compatibility...")
+            model_masked.train(False)
+            model_hybrid.train(False)
+            x = torch.randn(1, 3, 64, 64, device='cuda')
+            with torch.inference_mode():
+                y_masked = model_masked(x)
+                y_hybrid = model_hybrid(x)
+            assert y_masked.shape == y_hybrid.shape, (
+                f"Shape mismatch: masked={y_masked.shape} vs hybrid={y_hybrid.shape}"
+            )
+            print(f"  Output shapes match: {y_masked.shape}")
+            print("  Masked/hybrid compatibility verified.")
+        else:
+            print("\nSkipping hybrid mode (Flex Attention not available).")
+            model_masked.train(False)
+            x = torch.randn(1, 3, 64, 64, device='cuda')
+            with torch.inference_mode():
+                y_masked = model_masked(x)
+            print(f"  Masked output shape: {y_masked.shape}")
+            print("  Masked mode verified.")

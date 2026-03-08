@@ -14,6 +14,26 @@ DRFT builds on the Residual Hybrid Attention Group (RHAG) paradigm with several 
 - **Pixel Attention Upsampling** — Per-pixel attention weights refine features before PixelShuffle reconstruction.
 - **ECB Reparameterizable Conv** — Multi-branch training (3x3 + 1x1 + identity) that folds into a single 3x3 conv at inference for zero-cost accuracy gain.
 - **LayerScale** — Per-channel residual scaling initialized to small values for stable deep network training.
+- **Per-Window Routing** — Shifted window attention splits windows into interior (pure Flash, no mask) and boundary (masked) groups, avoiding unnecessary masking overhead on windows that don't straddle region boundaries.
+
+### Attention Modes
+
+DRFT supports two attention modes for shifted window masking:
+
+| Mode | Boundary Windows | Requirements | Use Case |
+|------|-----------------|--------------|----------|
+| `masked` (default) | SDPA with dense attn_mask | PyTorch >= 2.0 | Portable, works everywhere |
+| `hybrid` | Flex Attention with BlockMask | Triton + Linux | Maximum throughput on Linux |
+
+In both modes, **interior windows** (no cross-region contamination) always use Flash with zero overhead. Only boundary windows (last row/col of the shifted grid) need masking.
+
+```python
+# Default: portable masked mode
+model = drft_l(scale=4, attn_type='masked')
+
+# Linux with Triton: hybrid Flex Attention for boundary windows
+model = drft_l(scale=4, attn_type='hybrid')
+```
 
 ### Residual Formula
 
@@ -105,6 +125,7 @@ model.set_export_attention_mode(True)
 
 - PyTorch >= 2.0
 - CUDA with FlashAttention/SDPA support (recommended)
+- Triton + Linux (optional, for `attn_type='hybrid'` Flex Attention mode)
 
 ## TODO
 
@@ -128,6 +149,7 @@ This architecture builds on ideas and components from the following works:
 | SwiGLU FFN | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) | Noam Shazeer |
 | LayerScale | [Going Deeper with Image Transformers](https://arxiv.org/abs/2103.17239) (ICCV 2021) | Hugo Touvron, Matthieu Cord, Alexandre Sablayrolles, Gabriel Synnaeve, Herve Jegou |
 | Pixel Attention | [Efficient Image Super-Resolution Using Pixel Attention](https://arxiv.org/abs/2010.01073) (ECCVW 2020) | Hengyuan Zhao, Xiangtao Kong, Jingwen He, Yu Qiao, Chao Dong |
+| Flex Attention | [FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention](https://pytorch.org/blog/flexattention/) (PyTorch Blog 2024) | PyTorch Team |
 
 Trained with [traiNNer-redux](https://github.com/the-database/traiNNer-redux).
 
