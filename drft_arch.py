@@ -80,6 +80,12 @@ try:
 except ImportError:
     _FLEX_AVAILABLE = False
 
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    _SDPA_BACKEND_AVAILABLE = True
+except ImportError:
+    _SDPA_BACKEND_AVAILABLE = False
+
 ATTN_TYPE = Literal['masked', 'hybrid']
 
 # =============================================================================
@@ -186,6 +192,58 @@ def _make_bias_score_mod(bias_flat: torch.Tensor, seq_len: int):
 # first compilation, so per-instance compilation is redundant overhead.
 if _FLEX_AVAILABLE:
     _compiled_flex_attention = torch.compile(flex_attention, dynamic=True)
+
+
+_SHARED_OCAB_INDEX_CACHE: dict[tuple[int, int, int, int, str, int], torch.Tensor] = {}
+
+
+def _build_relative_position_index(
+    q_window_size: tuple[int, int],
+    k_window_size: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build cross-attention relative-position indices for OCAB."""
+    qh, qw = q_window_size
+    kh, kw = k_window_size
+
+    coords_q_h = torch.arange(qh, device=device)
+    coords_q_w = torch.arange(qw, device=device)
+    coords_q = torch.stack(torch.meshgrid(coords_q_h, coords_q_w, indexing='ij'))
+    coords_q_flatten = coords_q.flatten(1)
+
+    coords_k_h = torch.arange(kh, device=device)
+    coords_k_w = torch.arange(kw, device=device)
+    coords_k = torch.stack(torch.meshgrid(coords_k_h, coords_k_w, indexing='ij'))
+    coords_k_flatten = coords_k.flatten(1)
+
+    relative_coords = coords_k_flatten[:, None, :] - coords_q_flatten[:, :, None]
+    relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+    relative_coords[:, :, 0] += qh - 1
+    relative_coords[:, :, 1] += qw - 1
+    relative_coords[:, :, 0] *= qw + kw - 1
+    return relative_coords.sum(-1).long()
+
+
+def _get_shared_relative_position_index(
+    q_window_size: tuple[int, int],
+    k_window_size: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Get a shared OCAB relative-position index cache for the current device."""
+    device_index = -1 if device.index is None else int(device.index)
+    key = (
+        q_window_size[0],
+        q_window_size[1],
+        k_window_size[0],
+        k_window_size[1],
+        device.type,
+        device_index,
+    )
+    cached = _SHARED_OCAB_INDEX_CACHE.get(key)
+    if cached is None:
+        cached = _build_relative_position_index(q_window_size, k_window_size, device)
+        _SHARED_OCAB_INDEX_CACHE[key] = cached
+    return cached
 
 
 class DropPath(nn.Module):
@@ -1035,13 +1093,14 @@ class ACTBlock(nn.Module):
 # =============================================================================
 
 class OCAB(nn.Module):
-    """Overlapping Cross-Attention Block from HAT with i-LN normalization.
+    """Overlapping Cross-Attention Block with dense signed relative bias.
 
     Enables direct cross-window information flow using unfold
     with overlapping regions.
 
-    Uses rank-factored neural bias with asymmetric Q/K window sizes
-    to keep overlap attention Flash-compatible.
+    Uses a dense signed relative-position bias table inside OCAB only.
+    ACT remains rank-factorized; OCAB stays dense because its positional bias
+    is substantially higher-rank and signed, which is critical for text fidelity.
 
     i-LN: Uses spatially holistic normalization with input-adaptive rescaling
     to preserve input-dependent statistics (from i-LN paper).
@@ -1071,11 +1130,7 @@ class OCAB(nn.Module):
         self.rank = rank
         self.use_iln = use_iln
         self.force_math_attention = False
-
-        assert (self.head_dim + rank) % 8 == 0, (
-            f"head_dim({self.head_dim}) + rank({rank}) must be divisible by 8 for Flash kernels."
-        )
-        self.content_scale = self.head_dim ** -0.5
+        self.scale = head_dim ** -0.5
 
         # Normalization: iLN returns (normalized_output, std), LayerNorm returns tensor
         self.norm1 = iLN(dim) if use_iln else nn.LayerNorm(dim)
@@ -1085,12 +1140,12 @@ class OCAB(nn.Module):
             stride=window_size,
             padding=(self.overlap_win_size - window_size) // 2,
         )
-        self.neural_bias = RankFactoredNeuralBias(
-            num_heads=num_heads,
-            q_window_size=(window_size, window_size),
-            k_window_size=(self.overlap_win_size, self.overlap_win_size),
-            rank=rank,
+
+        hspan = window_size + self.overlap_win_size - 1
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros(hspan * hspan, num_heads)
         )
+        trunc_normal_(self.relative_position_bias_table, std=0.02)
 
         self.proj = nn.Linear(dim, dim)
 
@@ -1100,6 +1155,23 @@ class OCAB(nn.Module):
 
         self.norm2 = iLN(dim) if use_iln else nn.LayerNorm(dim)
         self.ffn = ConvSwiGLUFFN(dim=dim, expansion_factor=mlp_ratio)
+
+    @property
+    def q_window_size(self) -> tuple[int, int]:
+        return (self.window_size, self.window_size)
+
+    @property
+    def k_window_size(self) -> tuple[int, int]:
+        return (self.overlap_win_size, self.overlap_win_size)
+
+    def _relative_position_bias(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Materialize dense OCAB bias late and in the attention dtype."""
+        index = _get_shared_relative_position_index(self.q_window_size, self.k_window_size, device)
+        n_q = self.window_size * self.window_size
+        n_k = self.overlap_win_size * self.overlap_win_size
+        bias = self.relative_position_bias_table[index.view(-1)]
+        bias = bias.view(n_q, n_k, self.num_heads).permute(2, 0, 1).contiguous()
+        return bias.to(dtype=dtype).unsqueeze(0)
     
     def forward(self, x: torch.Tensor, x_size: tuple[int, int]) -> torch.Tensor:
         H, W = x_size
@@ -1142,26 +1214,31 @@ class OCAB(nn.Module):
         k = k_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        bq, bk = self.neural_bias()
-        bq = bq.unsqueeze(0).to(dtype=q.dtype).expand(B_, -1, -1, -1)
-        bk = bk.unsqueeze(0).to(dtype=k.dtype).expand(B_, -1, -1, -1)
-
-        q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
-        k_aug = torch.cat([k, bk], dim=-1)
-        v_aug = F.pad(v, (0, self.rank))
-
+        attn_bias = self._relative_position_bias(q.device, q.dtype)
         use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
-        x = _scaled_dot_product_attention_export_safe(
-            q_aug,
-            k_aug,
-            v_aug,
-            attn_mask=None,
-            dropout_p=0.0,
-            scale=1.0,
-            training=self.training,
-            use_export_safe_math=use_export_safe_math,
-        )
-        x = x[..., : self.head_dim]
+
+        if use_export_safe_math or not _SDPA_BACKEND_AVAILABLE or not q.is_cuda:
+            x = _scaled_dot_product_attention_export_safe(
+                q,
+                k,
+                v,
+                attn_mask=attn_bias,
+                dropout_p=0.0,
+                scale=self.scale,
+                training=self.training,
+                use_export_safe_math=use_export_safe_math,
+            )
+        else:
+            with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+                x = F.scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    attn_mask=attn_bias,
+                    dropout_p=0.0,
+                    scale=self.scale,
+                )
+
         x = x.transpose(1, 2).reshape(B_, Nq, self.dim)
 
         # Merge windows
@@ -1574,7 +1651,7 @@ class DRFT(nn.Module):
         img_range: Image value range (1.0 or 255.0).
         resi_connection: Residual connection type ('1conv', '3conv', 'identity').
         dense_skip: Use dense skip connections (DRCT-style).
-        rank: Rank for factorized position bias.
+        rank: Rank for factorized ACT position bias.
         use_iln: Use iLN (image restoration tailored LayerNorm) with std rescaling.
             When False, uses standard nn.LayerNorm without std-based residual rescaling.
             Hardcoded to the first 2 RHAG stages when enabled.
