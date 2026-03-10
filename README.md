@@ -46,7 +46,7 @@ Where `std` is the stabilized standard deviation from i-LN (detached, compressed
 
 ## Benchmark Results (x4 SR)
 
-Preliminary results with DRFT-L at 706K/800K training iterations (training in progress):
+Preliminary results with DRFT-L at 717K/800K training iterations (training in progress):
 
 | Method | Urban100 PSNR | Urban100 SSIM | Manga109 PSNR | Manga109 SSIM |
 |--------|:-:|:-:|:-:|:-:|
