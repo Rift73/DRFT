@@ -12,9 +12,9 @@ DRFT builds on the Residual Hybrid Attention Group (RHAG) paradigm with several 
 - **Dense Skip Connections** — DRCT-style dense fusion within each RHAG for information preservation across transformer blocks.
 - **Overlapping Cross-Attention (OCAB)** — HAT-style cross-window attention with asymmetric rank-factored bias for direct inter-window information flow.
 - **Pixel Attention Upsampling** — Per-pixel attention weights refine features before PixelShuffle reconstruction.
-- **ECB Reparameterizable Conv** — Multi-branch training (3x3 + 1x1 + identity) that folds into a single 3x3 conv at inference for zero-cost accuracy gain.
+- **ECB Reparameterizable Conv** — Multi-branch training (3x3 + 1x1 + identity) for richer training and faster inference.
 - **LayerScale** — Per-channel residual scaling initialized to small values for stable deep network training.
-- **Per-Window Routing** — Shifted window attention splits windows into interior (pure Flash, no mask) and boundary (masked) groups, avoiding unnecessary masking overhead on windows that don't straddle region boundaries.
+- **Per-Window Routing** — Shifted window attention splits windows into interior and boundary (masked) groups, avoiding unnecessary masking overhead on windows that don't straddle region boundaries.
 
 ### Attention Modes
 
