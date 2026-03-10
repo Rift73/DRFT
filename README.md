@@ -70,7 +70,7 @@ Preliminary results with DRFT-L at 717K/800K training iterations (training in pr
 | DRFT-M | 192 | 6 | 6 | 32 | Yes |
 | DRFT-L | 192 | 12 | 6 | 32 | Yes |
 
-All variants use `head_dim=32` and `rank=8` (augmented dim = 40), satisfying FlashAttention alignment constraints.
+All variants use `head_dim=32` and `rank=32` (augmented dim = 64), satisfying FlashAttention alignment constraints and tensor alignment for speed boost.
 
 ## Usage
 
