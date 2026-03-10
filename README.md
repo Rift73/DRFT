@@ -55,11 +55,11 @@ Preliminary results with DRFT-L at 706K/800K training iterations (training in pr
 | HAT-L | 28.60 | 0.8498 | 33.09 | 0.9335 |
 | HAT-L* | 28.93 | 0.8562 | 33.28 | 0.9348 |
 | DRCT-L | 28.70 | 0.8508 | 33.14 | 0.9347 |
-| **DRFT-L*** (708K/800K) | **29.15** | **0.8603** | **33.32** | **0.9352** |
+| **DRFT-L*** (717K/800K) | **29.27** | **0.8626** | **33.33** | **0.9354** |
 
 \* Trained on the same enhanced dataset.
 
-> Note: Results are preliminary. Training has not yet converged (708K of 800K iterations).
+> Note: Results are preliminary. Training has not yet converged (717K of 800K iterations).
 
 ## Model Variants
 
