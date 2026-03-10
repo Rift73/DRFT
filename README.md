@@ -27,26 +27,9 @@ DRFT supports two attention modes for shifted window masking:
 
 In both modes, **interior windows** (no cross-region contamination) always use Flash with zero overhead. Only boundary windows (last row/col of the shifted grid) need masking.
 
-```python
-# Default: portable masked mode
-model = drft_l(scale=4, attn_type='masked')
-
-# Linux with Triton: hybrid Flex Attention for boundary windows
-model = drft_l(scale=4, attn_type='hybrid')
-```
-
-### Residual Formula
-
-```
-x + std * drop_path(ls(attn)) + ls(conv) * conv_scale    # Attention adapts to input via std
-x + std * drop_path(ls(ffn))                              # FFN also rescaled by std
-```
-
-Where `std` is the stabilized standard deviation from i-LN (detached, compressed, clamped).
-
 ## Benchmark Results (x4 SR)
 
-Preliminary results with DRFT-L at 717K/800K training iterations (training in progress):
+Preliminary results with DRFT-L at 727K/800K training iterations (training in progress):
 
 | Method | Urban100 PSNR | Urban100 SSIM | Manga109 PSNR | Manga109 SSIM |
 |--------|:-:|:-:|:-:|:-:|
@@ -55,11 +38,11 @@ Preliminary results with DRFT-L at 717K/800K training iterations (training in pr
 | HAT-L | 28.60 | 0.8498 | 33.09 | 0.9335 |
 | HAT-L* | 28.93 | 0.8562 | 33.28 | 0.9348 |
 | DRCT-L | 28.70 | 0.8508 | 33.14 | 0.9347 |
-| **DRFT-L*** (717K/800K) | **29.27** | **0.8626** | **33.33** | **0.9354** |
+| **DRFT-L*** (727K/800K) | **29.27** | **0.8626** | **33.35** | **0.9355** |
 
 \* Trained on the same enhanced dataset.
 
-> Note: Results are preliminary. Training has not yet converged (717K of 800K iterations).
+> Note: Results are preliminary. Training has not yet converged (727K of 800K iterations).
 
 ## Model Variants
 
@@ -71,37 +54,6 @@ Preliminary results with DRFT-L at 717K/800K training iterations (training in pr
 | DRFT-L | 192 | 12 | 6 | 32 | Yes |
 
 All variants use `head_dim=32` and `rank=32` (augmented dim = 64), satisfying FlashAttention alignment constraints and tensor alignment for speed boost.
-
-## Usage
-
-```python
-import torch
-from drft_arch import DRFT, drft_l, drft_m, drft_s, drft_xs
-
-# Using factory functions
-model = drft_l(scale=4)
-
-# Or direct construction with custom config
-model = DRFT(
-    upscale=4,
-    embed_dim=192,
-    depths=(6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6),
-    num_heads=(6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6),
-    window_size=32,
-    overlap_ratio=0.5,
-    mlp_ratio=2.667,
-    drop_path_rate=0.1,
-    dense_skip=True,
-    use_iln=True,
-    rank=8,
-)
-
-# Best performance with FP16 inference
-model = model.half().cuda()
-x = torch.randn(1, 3, 64, 64, device='cuda', dtype=torch.float16)
-with torch.no_grad():
-    output = model(x)  # (1, 3, 256, 256) for scale=4
-```
 
 ### Weight Folding
 
