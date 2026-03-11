@@ -29,7 +29,7 @@ In both modes, **interior windows** (no cross-region contamination) always use F
 
 ## Benchmark Results (x4 SR)
 
-Preliminary results with DRFT-L at 738K/800K training iterations (training in progress):
+Preliminary results with DRFT-L at 746K/800K training iterations (training in progress):
 
 | Method | Urban100 PSNR | Urban100 SSIM | Manga109 PSNR | Manga109 SSIM |
 |--------|:-:|:-:|:-:|:-:|
@@ -38,11 +38,11 @@ Preliminary results with DRFT-L at 738K/800K training iterations (training in pr
 | HAT-L | 28.60 | 0.8498 | 33.09 | 0.9335 |
 | HAT-L* | 28.93 | 0.8562 | 33.28 | 0.9348 |
 | DRCT-L | 28.70 | 0.8508 | 33.14 | 0.9347 |
-| **DRFT-L*** (738K/800K) | **29.28** | **0.8627** | **33.35** | **0.9355** |
+| **DRFT-L*** (746K/800K) | **29.29** | **0.8630** | **33.37** | **0.9357** |
 
 \* Trained on the same enhanced dataset.
 
-> Note: Results are preliminary. Training has not yet converged (738K of 800K iterations).
+> Note: Results are preliminary. Training has not yet converged (746K of 800K iterations).
 
 ## Model Variants
 
