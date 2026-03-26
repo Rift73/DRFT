@@ -21,15 +21,15 @@ Design follows HAT_iLN's proven formula (with LayerScale for stable training):
 - Formula: x + std * drop_path(ls(attn)) + ls(conv) * conv_scale
 This ensures attention adapts to input while conv maintains texture in smooth regions.
 
-i-LN (stabilized practical variant from "Analyzing the Training Dynamics of IR Transformers"):
+i-LN (raw variant, matching TRFT — "Analyzing the Training Dynamics of IR Transformers"):
 - Replaces per-token LayerNorm with spatially holistic normalization (stats over [L*C])
 - std applied ONLY to attention output, NOT to conv
 - LN* stats computed in FP32 for numerical stability
-- Residual scale uses detached, compressed std with upper clamp:
-  scale = (std_raw.detach() + eps)^0.5, then clamp to max 4.0
+- Residual scale is raw std with gradients flowing through (no detach/compress/clamp)
+- LayerScale provides sufficient output gating — clamped std is redundant
 - Prevents feature magnitude divergence (million-scale) under conventional LayerNorm
 - Stabilizes channel-wise entropy during training
-- Applied to norm1/norm2 in ACTBlock and OCAB
+- Applied to norm1/norm2 in ACTBlock and OCAB across ALL RHAG stages
 
 Constraints:
 - embed_dim / num_heads must be divisible by 8 (SDPA/FlashAttention compatible)
@@ -402,11 +402,25 @@ class iLN(nn.Module):
         super().__init__()
         self.dim = dim
         self.eps = eps
-        self.scale_alpha = 0.5
-        self.scale_max = 4.0
         # Learnable affine parameters (same as standard LayerNorm)
         self.weight = nn.Parameter(torch.ones(dim))
         self.bias = nn.Parameter(torch.zeros(dim))
+        # EMA of std for adaptive explosion guard (non-persistent: not saved to checkpoints)
+        self.register_buffer('std_ema', torch.ones(1), persistent=False)
+        # Buffer for stashing std observation (like BN running stats — compile-safe)
+        self.register_buffer('_last_std_buf', torch.ones(1), persistent=False)
+        self._std_ema_initialized = False
+
+    def update_std_ema(self) -> None:
+        """Update EMA from last observed std. Called via pre-hook, outside compiled forward."""
+        with torch.no_grad():
+            batch_std = self._last_std_buf
+            if not self._std_ema_initialized:
+                self.std_ema.copy_(batch_std)
+                self._std_ema_initialized = True
+            else:
+                safe_std = torch.where(batch_std < 2.0 * self.std_ema, batch_std, self.std_ema)
+                self.std_ema.lerp_(safe_std, 1e-3)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Forward pass with holistic normalization.
@@ -426,6 +440,13 @@ class iLN(nn.Module):
         var, mean = torch.var_mean(x_fp32, dim=(1, 2), keepdim=True, correction=0)
         std_raw = torch.sqrt(var + self.eps)  # (B, 1, 1)
 
+        # Stash mean std for EMA update in pre-hook (buffer write, like BN running stats).
+        with torch.no_grad():
+            self._last_std_buf.copy_(std_raw.mean())
+
+        # Adaptive explosion guard: cap at 2x EMA (single fusible op).
+        scale = torch.min(std_raw, 2.0 * self.std_ema.detach())
+
         # Normalize in FP32 (paper-faithful normalization path).
         x_norm = (x_fp32 - mean) / std_raw
 
@@ -434,12 +455,7 @@ class iLN(nn.Module):
         b = self.bias.view(1, 1, -1).float()
         out = (w * x_norm + b).to(orig_dtype)
 
-        # Stabilized residual scale:
-        # - detach removes gradient feedback through scale
-        # - alpha<1 compresses high-variance updates
-        # - upper clamp prevents rare exploding updates
-        scale = (std_raw.detach() + self.eps).pow(self.scale_alpha)
-        scale = scale.clamp(max=self.scale_max).to(orig_dtype)
+        scale = scale.to(orig_dtype)
 
         # Caller applies residual as: x + scale * f(out)
         return out, scale
@@ -465,7 +481,7 @@ class RankFactoredNeuralBias(nn.Module):
         num_heads: int,
         q_window_size: tuple[int, int],
         k_window_size: Optional[tuple[int, int]] = None,
-        rank: int = 8,
+        rank: int = 32,
         hidden_dim: int = 128,
         scale_init: float = 0.5,
     ) -> None:
@@ -619,12 +635,6 @@ class ECBConvBlock(nn.Module):
         # Branch 3: Identity (represented as 1x1 with identity weights conceptually)
         # We'll just add input directly
 
-        # Pre-compute identity weight pattern as buffer (avoids allocation during folding)
-        identity_weight = torch.zeros(dim, dim, 3, 3)
-        for i in range(dim):
-            identity_weight[i, i, 1, 1] = 1.0
-        self.register_buffer("identity_weight", identity_weight)
-
         # Learnable branch weights
         self.branch_weight = nn.Parameter(torch.ones(3) / 3)
 
@@ -644,14 +654,57 @@ class ECBConvBlock(nn.Module):
         weight_1x1 = F.pad(self.conv1x1.weight, [1, 1, 1, 1]) * w[1]
         bias_1x1 = self.conv1x1.bias * w[1] if self.conv1x1.bias is not None else 0
 
-        # Identity as 3x3 (use pre-computed buffer)
-        weight_id = self.identity_weight * w[2]
+        # Build the folded identity kernel on demand to avoid registering a
+        # large static buffer that DDP would rebroadcast every forward.
+        weight_id = F.pad(
+            torch.eye(
+                self.dim,
+                device=self.conv3x3.weight.device,
+                dtype=self.conv3x3.weight.dtype,
+            ).view(self.dim, self.dim, 1, 1),
+            [1, 1, 1, 1],
+        ) * w[2]
 
         # Sum all branches
         folded_weight = weight_3x3 + weight_1x1 + weight_id
         folded_bias = bias_3x3 + bias_1x1
 
         return folded_weight, folded_bias
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        identity_weight = F.pad(
+            torch.eye(
+                self.dim,
+                device=self.conv3x3.weight.device,
+                dtype=self.conv3x3.weight.dtype,
+            ).view(self.dim, self.dim, 1, 1),
+            [1, 1, 1, 1],
+        )
+        destination[prefix + "identity_weight"] = (
+            identity_weight if keep_vars else identity_weight.detach()
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        state_dict.pop(prefix + "identity_weight", None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def fold(self) -> None:
         """Fold branches into single conv for inference.
@@ -680,7 +733,6 @@ class ECBConvBlock(nn.Module):
         del self.conv3x3
         del self.conv1x1
         del self.branch_weight
-        del self.identity_weight
 
         self._is_folded = True
 
@@ -747,6 +799,12 @@ class ConvSwiGLUFFN(nn.Module):
         # Depthwise conv for locality injection
         self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, groups=hidden_dim)
 
+        # Dilated depthwise conv for wider receptive field (zero-init coupling, checkpoint-safe)
+        self.dwconv_dilated = nn.Conv2d(
+            hidden_dim, hidden_dim, 3, 1, padding=2, dilation=2, groups=hidden_dim,
+        )
+        self.dil_scale = nn.Parameter(torch.zeros(1))
+
         # Output projection
         self.fc_out = nn.Linear(hidden_dim, dim)
 
@@ -766,6 +824,7 @@ class ConvSwiGLUFFN(nn.Module):
         # Reshape for depthwise conv
         x = x.transpose(1, 2).view(B, -1, H, W)  # (B, hidden, H, W)
         x = self.dwconv(x)
+        x = x + self.dil_scale * self.dwconv_dilated(x)
         x = x.flatten(2).transpose(1, 2)  # (B, N, hidden)
 
         # Output projection
@@ -795,7 +854,7 @@ class WindowAttentionRFB(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.,
         proj_drop: float = 0.,
-        rank: int = 8,
+        rank: int = 32,
         attn_type: ATTN_TYPE = 'masked',
     ) -> None:
         super().__init__()
@@ -813,12 +872,16 @@ class WindowAttentionRFB(nn.Module):
             f"head_dim({self.head_dim}) + rank({rank}) must be divisible by 8 for Flash kernels."
         )
 
-        self.content_scale = self.head_dim ** -0.5
+        self.logit_scale = nn.Parameter(
+            torch.full((num_heads,), self.head_dim ** -0.5)
+        )
+        self.val_res_scale = nn.Parameter(torch.zeros(num_heads))
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
         self.attn_drop_p = attn_drop
         self.force_math_attention = False
+        self.force_additive_attention = False
 
         self.neural_bias = RankFactoredNeuralBias(
             num_heads=num_heads,
@@ -838,9 +901,32 @@ class WindowAttentionRFB(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        bq, bk = self.neural_bias()
+        # Per-head learned temperature (init = 1/sqrt(d), checkpoint-safe)
+        q = q * self.logit_scale.view(1, self.num_heads, 1, 1)
 
-        if self.attn_type == 'hybrid' and mask is not None:
+        bq, bk = self.neural_bias()
+        use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
+        force_additive_attention = self.force_additive_attention or use_export_safe_math
+
+        if force_additive_attention:
+            # The additive-bias path is mathematically equivalent to the
+            # flash-style augmented-Q/K formulation, but exports to a much
+            # simpler ONNX/TensorRT graph.
+            bias = torch.einsum('hnr,hmr->hnm', bq, bk)
+            attn_mask = bias.unsqueeze(0)
+            if mask is not None:
+                attn_mask = attn_mask + mask.to(dtype=attn_mask.dtype)
+            out = _scaled_dot_product_attention_export_safe(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                dropout_p=self.attn_drop_p,
+                scale=1.0,
+                training=self.training,
+                use_export_safe_math=use_export_safe_math,
+            )
+        elif self.attn_type == 'hybrid' and mask is not None:
             # Flex Attention path: bias via score_mod, region mask via BlockMask.
             # Only used for boundary windows in shifted blocks (requires Triton).
             bias_flat = torch.einsum('hnr,hmr->hnm', bq, bk).reshape(
@@ -851,37 +937,30 @@ class WindowAttentionRFB(nn.Module):
                 q, k, v,
                 score_mod=score_mod,
                 block_mask=mask,
-                scale=self.content_scale,
+                scale=1.0,
             )
         elif self.attn_type == 'masked' and mask is not None:
-            # SDPA path: bias + region mask → dense attn_mask.
-            # Used for boundary windows in shifted blocks (portable, no Triton).
-            # Standard Q/K/V with explicit bias — no augmentation or V padding.
-            bias = torch.einsum('hnr,hmr->hnm', bq, bk)  # (num_heads, ws², ws²)
-            attn_mask = bias.unsqueeze(0) + mask.to(dtype=bias.dtype)  # (B_bnd, num_heads, ws², ws²)
-            use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
+            # SDPA path: bias + region mask -> dense attn_mask.
+            bias = torch.einsum('hnr,hmr->hnm', bq, bk)
+            attn_mask = bias.unsqueeze(0) + mask.to(dtype=bias.dtype)
             out = _scaled_dot_product_attention_export_safe(
                 q, k, v,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_drop_p,
-                scale=self.content_scale,
+                scale=1.0,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
             )
         else:
             # Flash path: bias via Q/K concatenation, no mask needed.
-            # Used for non-shifted windows and interior shifted windows
-            # in both modes (they have no cross-window contamination risk).
+            # Q is already scaled by logit_scale above.
             bq = bq.unsqueeze(0).to(dtype=q.dtype).expand(b_windows, -1, -1, -1)
             bk = bk.unsqueeze(0).to(dtype=k.dtype).expand(b_windows, -1, -1, -1)
 
-            q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
+            q_aug = torch.cat([q, bq], dim=-1)
             k_aug = torch.cat([k, bk], dim=-1)
-            # Flash SDP in PyTorch requires q/k/v to share the same head dim.
-            # Pad V with zeros to (head_dim + rank), run attention, then crop back.
             v_aug = F.pad(v, (0, self.rank))
 
-            use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
             out = _scaled_dot_product_attention_export_safe(
                 q_aug,
                 k_aug,
@@ -893,6 +972,10 @@ class WindowAttentionRFB(nn.Module):
                 use_export_safe_math=use_export_safe_math,
             )
             out = out[..., : self.head_dim]
+
+        # Value residual: preserves token info through deep attention (zero-init, checkpoint-safe)
+        v_mean = v.mean(dim=-2, keepdim=True)
+        out = out + self.val_res_scale.view(1, self.num_heads, 1, 1) * v_mean
 
         out = out.transpose(1, 2).reshape(b_windows, n_tokens, c)
         out = self.proj(out)
@@ -930,7 +1013,7 @@ class ACTBlock(nn.Module):
         drop_path: float = 0.,
         conv_scale: float = 0.01,
         layer_scale_init: float = 1e-6,
-        rank: int = 8,
+        rank: int = 32,
         use_iln: bool = False,
         attn_type: ATTN_TYPE = 'masked',
     ) -> None:
@@ -943,6 +1026,7 @@ class ACTBlock(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.conv_scale = conv_scale
         self.use_iln = use_iln
+        self.force_dense_shifted_attention = False
 
         if min(self.input_resolution) <= self.window_size:
             self.shift_size = 0
@@ -1021,28 +1105,31 @@ class ACTBlock(nn.Module):
         if self.shift_size > 0 and hybrid_ctx is not None:
             region_mask, int_idx_full, bnd_idx_full = hybrid_ctx
 
-            # Process each group sequentially: gather -> attn -> scatter -> free,
-            # so both temporary outputs are never alive at the same time.
-            # Guard empty index groups and align dtypes for index_put under AMP/BF16.
-            attn_windows = torch.empty_like(x_windows)
+            if self.force_dense_shifted_attention:
+                attn_windows = self.attn(x_windows, mask=region_mask)
+            else:
+                # Process each group sequentially: gather -> attn -> scatter -> free,
+                # so both temporary outputs are never alive at the same time.
+                # Guard empty index groups and align dtypes for index_put under AMP/BF16.
+                attn_windows = torch.empty_like(x_windows)
 
-            # Interior windows: Flash path (no mask needed)
-            if int_idx_full.numel() > 0:
-                interior_windows = x_windows[int_idx_full]
-                interior_out = self.attn(interior_windows)
-                if interior_out.dtype != attn_windows.dtype:
-                    interior_out = interior_out.to(dtype=attn_windows.dtype)
-                attn_windows[int_idx_full] = interior_out
-                del interior_windows, interior_out
+                # Interior windows: Flash path (no mask needed)
+                if int_idx_full.numel() > 0:
+                    interior_windows = x_windows[int_idx_full]
+                    interior_out = self.attn(interior_windows)
+                    if interior_out.dtype != attn_windows.dtype:
+                        interior_out = interior_out.to(dtype=attn_windows.dtype)
+                    attn_windows[int_idx_full] = interior_out
+                    del interior_windows, interior_out
 
-            # Boundary windows: masked SDPA or Flex (with region mask)
-            if bnd_idx_full.numel() > 0:
-                boundary_windows = x_windows[bnd_idx_full]
-                boundary_out = self.attn(boundary_windows, mask=region_mask)
-                if boundary_out.dtype != attn_windows.dtype:
-                    boundary_out = boundary_out.to(dtype=attn_windows.dtype)
-                attn_windows[bnd_idx_full] = boundary_out
-                del boundary_windows, boundary_out
+                # Boundary windows: masked SDPA or Flex (with region mask)
+                if bnd_idx_full.numel() > 0:
+                    boundary_windows = x_windows[bnd_idx_full]
+                    boundary_out = self.attn(boundary_windows, mask=region_mask)
+                    if boundary_out.dtype != attn_windows.dtype:
+                        boundary_out = boundary_out.to(dtype=attn_windows.dtype)
+                    attn_windows[bnd_idx_full] = boundary_out
+                    del boundary_windows, boundary_out
         else:
             attn_windows = self.attn(x_windows)
 
@@ -1116,7 +1203,7 @@ class OCAB(nn.Module):
         qkv_bias: bool = True,
         mlp_ratio: float = 2.667,
         layer_scale_init: float = 1e-6,
-        rank: int = 8,
+        rank: int = 32,
         use_iln: bool = False,
     ) -> None:
         super().__init__()
@@ -1130,7 +1217,10 @@ class OCAB(nn.Module):
         self.rank = rank
         self.use_iln = use_iln
         self.force_math_attention = False
-        self.scale = head_dim ** -0.5
+        self.logit_scale = nn.Parameter(
+            torch.full((num_heads,), head_dim ** -0.5)
+        )
+        self.val_res_scale = nn.Parameter(torch.zeros(num_heads))
 
         # Normalization: iLN returns (normalized_output, std), LayerNorm returns tensor
         self.norm1 = iLN(dim) if use_iln else nn.LayerNorm(dim)
@@ -1214,6 +1304,9 @@ class OCAB(nn.Module):
         k = k_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
+        # Per-head learned temperature (init = 1/sqrt(d), checkpoint-safe)
+        q = q * self.logit_scale.view(1, self.num_heads, 1, 1)
+
         attn_bias = self._relative_position_bias(q.device, q.dtype)
         use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
 
@@ -1224,7 +1317,7 @@ class OCAB(nn.Module):
                 v,
                 attn_mask=attn_bias,
                 dropout_p=0.0,
-                scale=self.scale,
+                scale=1.0,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
             )
@@ -1236,8 +1329,12 @@ class OCAB(nn.Module):
                     v,
                     attn_mask=attn_bias,
                     dropout_p=0.0,
-                    scale=self.scale,
+                    scale=1.0,
                 )
+
+        # Value residual: preserves token info through deep attention (zero-init, checkpoint-safe)
+        v_mean = v.mean(dim=-2, keepdim=True)
+        x = x + self.val_res_scale.view(1, self.num_heads, 1, 1) * v_mean
 
         x = x.transpose(1, 2).reshape(B_, Nq, self.dim)
 
@@ -1328,7 +1425,7 @@ class AttentionBlocks(nn.Module):
         use_checkpoint_act: Optional[bool] = None,
         use_checkpoint_ocab: Optional[bool] = None,
         dense_skip: bool = True,
-        rank: int = 8,
+        rank: int = 32,
         use_iln: bool = False,
         attn_type: ATTN_TYPE = 'masked',
     ) -> None:
@@ -1456,7 +1553,7 @@ class RHAG(nn.Module):
         use_checkpoint_ocab: Optional[bool] = None,
         dense_skip: bool = True,
         resi_connection: str = '1conv',
-        rank: int = 8,
+        rank: int = 32,
         use_iln: bool = False,
         attn_type: ATTN_TYPE = 'masked',
     ) -> None:
@@ -1682,7 +1779,7 @@ class DRFT(nn.Module):
         resi_connection: str = '1conv',
         dense_skip: bool = True,
         num_feat: int = 64,
-        rank: int = 8,
+        rank: int = 32,
         use_iln: bool = False,
         attn_type: ATTN_TYPE = 'masked',
     ) -> None:
@@ -1710,6 +1807,7 @@ class DRFT(nn.Module):
         self.upscale = upscale
         self.window_size = window_size
         self.attn_type = attn_type
+        self.force_tensorrt_export_mode = False
         
         # Image mean for normalization (RGB mean from ImageNet)
         if in_chans == 3:
@@ -1737,8 +1835,7 @@ class DRFT(nn.Module):
         
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            # Hardcoded: only first 2 RHAG stages use iLN when enabled.
-            stage_use_iln = use_iln and (i_layer < 2)
+            stage_use_iln = use_iln
             layer = RHAG(
                 dim=embed_dim,
                 input_resolution=patches_resolution,
@@ -1765,13 +1862,9 @@ class DRFT(nn.Module):
             self.layers.append(layer)
 
         # Final norm selection:
-        # - Full iLN path (all stages use iLN): AffineTransform (matching HAT_iLN)
-        # - Hybrid path (early iLN + deeper LN): LayerNorm
-        # - Standard path (no iLN): LayerNorm
-        is_partial_iln = use_iln and (self.num_layers > 2)
-        self.norm = nn.LayerNorm(embed_dim) if is_partial_iln else (
-            AffineTransform(embed_dim) if use_iln else nn.LayerNorm(embed_dim)
-        )
+        # iLN path: AffineTransform (no re-normalization after iLN stages)
+        # Standard path: LayerNorm
+        self.norm = AffineTransform(embed_dim) if use_iln else nn.LayerNorm(embed_dim)
         
         # Feature fusion before upsampling
         self.conv_after_body = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
@@ -1801,6 +1894,10 @@ class DRFT(nn.Module):
             self._dense_mask_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
         elif attn_type == 'hybrid':
             self._block_mask_cache: OrderedDict[tuple, object] = OrderedDict()
+
+        # Auto-update iLN EMA after each forward (runs outside compiled graph).
+        if use_iln:
+            self.register_forward_pre_hook(lambda mod, inp: mod.update_iln_ema())
 
     def _compute_region_ids(self, H: int, W: int, device: torch.device) -> torch.Tensor:
         """Compute Swin-style region IDs for shifted window masking.
@@ -1964,6 +2061,46 @@ class DRFT(nn.Module):
 
         return self._dense_mask_cache[mask_key]
 
+    def _get_shifted_dense_mask_all_windows(
+        self, B: int, H: int, W: int, device: torch.device,
+    ) -> torch.Tensor:
+        """Get or create a dense shifted-window mask for every window.
+
+        Interior windows become all-zero masks, while boundary windows keep the
+        usual same-region versus blocked-region structure. This simplifies the
+        exported graph by letting all shifted windows share one masked path.
+        """
+        if torch.onnx.is_in_onnx_export():
+            region_ids = self._compute_region_ids(H, W, device)
+            same_region = region_ids.unsqueeze(2) == region_ids.unsqueeze(1)
+            mask = torch.zeros(same_region.shape, dtype=torch.float32, device=device)
+            mask.masked_fill_(~same_region, float('-inf'))
+            return mask.unsqueeze(1).repeat(B, 1, 1, 1)
+
+        mask_key = (B, H, W, device, "all")
+        if mask_key not in self._dense_mask_cache:
+            region_key = (H, W, device)
+            if region_key not in self._region_cache:
+                self._region_cache[region_key] = self._compute_region_ids(H, W, device)
+                if len(self._region_cache) > self._mask_cache_max:
+                    self._region_cache.popitem(last=False)
+            else:
+                self._region_cache.move_to_end(region_key)
+            region_ids = self._region_cache[region_key]  # (nW, ws²)
+
+            same_region = region_ids.unsqueeze(2) == region_ids.unsqueeze(1)
+            mask = torch.zeros(same_region.shape, dtype=torch.float32, device=device)
+            mask.masked_fill_(~same_region, float('-inf'))
+            mask = mask.unsqueeze(1).repeat(B, 1, 1, 1)
+
+            self._dense_mask_cache[mask_key] = mask
+            if len(self._dense_mask_cache) > self._mask_cache_max:
+                self._dense_mask_cache.popitem(last=False)
+        else:
+            self._dense_mask_cache.move_to_end(mask_key)
+
+        return self._dense_mask_cache[mask_key]
+
     def _get_shifted_block_mask(
         self, B: int, H: int, W: int, device: torch.device,
     ) -> BlockMask:
@@ -2045,8 +2182,12 @@ class DRFT(nn.Module):
         # Both mask types and batch indices are cached at model level.
         if self.attn_type == 'masked':
             B = x.shape[0]
-            dense_mask = self._get_shifted_dense_mask(B, H, W, x.device)
-            int_idx_full, bnd_idx_full = self._get_batch_indices(B, H, W, x.device)
+            if self.force_tensorrt_export_mode:
+                dense_mask = self._get_shifted_dense_mask_all_windows(B, H, W, x.device)
+                int_idx_full, bnd_idx_full = None, None
+            else:
+                dense_mask = self._get_shifted_dense_mask(B, H, W, x.device)
+                int_idx_full, bnd_idx_full = self._get_batch_indices(B, H, W, x.device)
             hybrid_ctx = (dense_mask, int_idx_full, bnd_idx_full)
         elif self.attn_type == 'hybrid':
             B = x.shape[0]
@@ -2114,6 +2255,12 @@ class DRFT(nn.Module):
             if isinstance(module, ECBConvBlock):
                 module.unfold()
 
+    def update_iln_ema(self) -> None:
+        """Update all iLN EMA stats from last forward. Call outside compiled forward."""
+        for module in self.modules():
+            if isinstance(module, iLN):
+                module.update_std_ema()
+
     def set_export_attention_mode(self, enabled: bool = True) -> None:
         """Force math-attention path in all attention modules.
 
@@ -2124,6 +2271,24 @@ class DRFT(nn.Module):
         for module in self.modules():
             if isinstance(module, (WindowAttentionRFB, OCAB)):
                 module.force_math_attention = enabled
+
+    def set_tensorrt_export_mode(self, enabled: bool = True) -> None:
+        """Use a TensorRT/ONNX-friendly attention graph during export.
+
+        This keeps weights and checkpoint structure unchanged while simplifying
+        the exported graph:
+        - force explicit math-attention
+        - use additive attention bias instead of augmented Q/K/V attention
+        - route all shifted ACT windows through one dense masked path
+        """
+        self.force_tensorrt_export_mode = enabled
+        for module in self.modules():
+            if isinstance(module, (WindowAttentionRFB, OCAB)):
+                module.force_math_attention = enabled
+            if isinstance(module, WindowAttentionRFB):
+                module.force_additive_attention = enabled
+            if isinstance(module, ACTBlock):
+                module.force_dense_shifted_attention = enabled
 
 
 # =============================================================================
@@ -2308,7 +2473,7 @@ if __name__ == '__main__':
     print(f"  drft_s:  embed_dim=160, 6 layers, heads=5, head_dim=32")
     print(f"  drft_m:  embed_dim=192, 6 layers, heads=6, head_dim=32")
     print(f"  drft_l:  embed_dim=192, 12 layers, heads=6, head_dim=32")
-    print("\nAll models satisfy Flash constraints (head_dim=32, rank=8 => 40)")
+    print("\nAll models satisfy Flash constraints (head_dim=32, rank=32 => 64)")
 
     # Run DDP check if CUDA available
     if torch.cuda.is_available():
