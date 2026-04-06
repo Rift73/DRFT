@@ -16,14 +16,13 @@ Key innovations:
 
 Design follows HAT_iLN's proven formula (with LayerScale for stable training):
 - Attention: std-scaled (input-adaptive rescaling via i-LN) + LayerScale
-- Conv: independent of std (0.01 weight via conv_scale) + LayerScale
+- Conv: std-scaled (input-adaptive rescaling via i-LN) + LayerScale
 - FFN: std-scaled (input-adaptive rescaling via i-LN) + LayerScale
-- Formula: x + std * drop_path(ls(attn)) + ls(conv) * conv_scale
-This ensures attention adapts to input while conv maintains texture in smooth regions.
+- Formula: x + std * (drop_path(ls(attn)) + ls(conv) * conv_scale)
 
 i-LN (raw variant, matching TRFT — "Analyzing the Training Dynamics of IR Transformers"):
 - Replaces per-token LayerNorm with spatially holistic normalization (stats over [L*C])
-- std applied ONLY to attention output, NOT to conv
+- std applied to BOTH attention and conv outputs
 - LN* stats computed in FP32 for numerical stability
 - Residual scale is raw std with gradients flowing through (no detach/compress/clamp)
 - LayerScale provides sufficient output gating — clamped std is redundant
@@ -799,12 +798,6 @@ class ConvSwiGLUFFN(nn.Module):
         # Depthwise conv for locality injection
         self.dwconv = nn.Conv2d(hidden_dim, hidden_dim, 3, 1, 1, groups=hidden_dim)
 
-        # Dilated depthwise conv for wider receptive field (zero-init coupling, checkpoint-safe)
-        self.dwconv_dilated = nn.Conv2d(
-            hidden_dim, hidden_dim, 3, 1, padding=2, dilation=2, groups=hidden_dim,
-        )
-        self.dil_scale = nn.Parameter(torch.zeros(1))
-
         # Output projection
         self.fc_out = nn.Linear(hidden_dim, dim)
 
@@ -824,7 +817,6 @@ class ConvSwiGLUFFN(nn.Module):
         # Reshape for depthwise conv
         x = x.transpose(1, 2).view(B, -1, H, W)  # (B, hidden, H, W)
         x = self.dwconv(x)
-        x = x + self.dil_scale * self.dwconv_dilated(x)
         x = x.flatten(2).transpose(1, 2)  # (B, N, hidden)
 
         # Output projection
@@ -872,10 +864,7 @@ class WindowAttentionRFB(nn.Module):
             f"head_dim({self.head_dim}) + rank({rank}) must be divisible by 8 for Flash kernels."
         )
 
-        self.logit_scale = nn.Parameter(
-            torch.full((num_heads,), self.head_dim ** -0.5)
-        )
-        self.val_res_scale = nn.Parameter(torch.zeros(num_heads))
+        self.content_scale = self.head_dim ** -0.5
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop) if proj_drop > 0.0 else nn.Identity()
@@ -901,9 +890,6 @@ class WindowAttentionRFB(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
 
-        # Per-head learned temperature (init = 1/sqrt(d), checkpoint-safe)
-        q = q * self.logit_scale.view(1, self.num_heads, 1, 1)
-
         bq, bk = self.neural_bias()
         use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
         force_additive_attention = self.force_additive_attention or use_export_safe_math
@@ -922,7 +908,7 @@ class WindowAttentionRFB(nn.Module):
                 v,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_drop_p,
-                scale=1.0,
+                scale=self.content_scale,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
             )
@@ -937,7 +923,7 @@ class WindowAttentionRFB(nn.Module):
                 q, k, v,
                 score_mod=score_mod,
                 block_mask=mask,
-                scale=1.0,
+                scale=self.content_scale,
             )
         elif self.attn_type == 'masked' and mask is not None:
             # SDPA path: bias + region mask -> dense attn_mask.
@@ -947,17 +933,16 @@ class WindowAttentionRFB(nn.Module):
                 q, k, v,
                 attn_mask=attn_mask,
                 dropout_p=self.attn_drop_p,
-                scale=1.0,
+                scale=self.content_scale,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
             )
         else:
             # Flash path: bias via Q/K concatenation, no mask needed.
-            # Q is already scaled by logit_scale above.
             bq = bq.unsqueeze(0).to(dtype=q.dtype).expand(b_windows, -1, -1, -1)
             bk = bk.unsqueeze(0).to(dtype=k.dtype).expand(b_windows, -1, -1, -1)
 
-            q_aug = torch.cat([q, bq], dim=-1)
+            q_aug = torch.cat([q * self.content_scale, bq], dim=-1)
             k_aug = torch.cat([k, bk], dim=-1)
             v_aug = F.pad(v, (0, self.rank))
 
@@ -972,10 +957,6 @@ class WindowAttentionRFB(nn.Module):
                 use_export_safe_math=use_export_safe_math,
             )
             out = out[..., : self.head_dim]
-
-        # Value residual: preserves token info through deep attention (zero-init, checkpoint-safe)
-        v_mean = v.mean(dim=-2, keepdim=True)
-        out = out + self.val_res_scale.view(1, self.num_heads, 1, 1) * v_mean
 
         out = out.transpose(1, 2).reshape(b_windows, n_tokens, c)
         out = self.proj(out)
@@ -996,7 +977,7 @@ class ACTBlock(nn.Module):
     - Conv-SwiGLU FFN (fused gate+value)
     - i-LN with input-adaptive rescaling (see module docstring for details)
 
-    Residual formula: x + std * drop_path(ls(attn)) + ls(conv) * conv_scale
+    Residual formula: x + std * (drop_path(ls(attn)) + ls(conv) * conv_scale)
     """
 
     def __init__(
@@ -1152,10 +1133,10 @@ class ACTBlock(nn.Module):
         conv_x = self.ls_conv(conv_x)
 
         # Combine branches:
-        # iLN: std multiplies attention output (input-adaptive rescaling)
+        # iLN: std multiplies both attention and conv outputs (input-adaptive rescaling)
         # LayerNorm: standard residual connection without std rescaling
         if self.use_iln:
-            x = shortcut + std1 * self.drop_path(attn_x) + conv_x * self.conv_scale
+            x = shortcut + std1 * (self.drop_path(attn_x) + conv_x * self.conv_scale)
         else:
             x = shortcut + self.drop_path(attn_x) + conv_x * self.conv_scale
 
@@ -1217,10 +1198,7 @@ class OCAB(nn.Module):
         self.rank = rank
         self.use_iln = use_iln
         self.force_math_attention = False
-        self.logit_scale = nn.Parameter(
-            torch.full((num_heads,), head_dim ** -0.5)
-        )
-        self.val_res_scale = nn.Parameter(torch.zeros(num_heads))
+        self.scale = head_dim ** -0.5
 
         # Normalization: iLN returns (normalized_output, std), LayerNorm returns tensor
         self.norm1 = iLN(dim) if use_iln else nn.LayerNorm(dim)
@@ -1304,9 +1282,6 @@ class OCAB(nn.Module):
         k = k_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v_windows.reshape(B_, Nk, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Per-head learned temperature (init = 1/sqrt(d), checkpoint-safe)
-        q = q * self.logit_scale.view(1, self.num_heads, 1, 1)
-
         attn_bias = self._relative_position_bias(q.device, q.dtype)
         use_export_safe_math = self.force_math_attention or torch.onnx.is_in_onnx_export()
 
@@ -1317,7 +1292,7 @@ class OCAB(nn.Module):
                 v,
                 attn_mask=attn_bias,
                 dropout_p=0.0,
-                scale=1.0,
+                scale=self.scale,
                 training=self.training,
                 use_export_safe_math=use_export_safe_math,
             )
@@ -1329,12 +1304,8 @@ class OCAB(nn.Module):
                     v,
                     attn_mask=attn_bias,
                     dropout_p=0.0,
-                    scale=1.0,
+                    scale=self.scale,
                 )
-
-        # Value residual: preserves token info through deep attention (zero-init, checkpoint-safe)
-        v_mean = v.mean(dim=-2, keepdim=True)
-        x = x + self.val_res_scale.view(1, self.num_heads, 1, 1) * v_mean
 
         x = x.transpose(1, 2).reshape(B_, Nq, self.dim)
 
