@@ -1,107 +1,175 @@
 # DRFT: Dense Rank-Factored Transformer for Image Super-Resolution
 
-A transformer architecture for single image super-resolution that combines rank-factored implicit neural bias, dense skip connections, and hybrid attention-convolution blocks.
+DRFT is a single-image super-resolution transformer designed around image-wide normalization, efficient local attention, dense residual refinement, and deployment-aware graph structure.
 
-## Architecture
+This repository tracks the current `drft_arch.py` from the DRFT traiNNer-redux development tree. The previous standalone implementation is preserved locally as `drft_legacy.bak` and intentionally ignored by Git.
 
-DRFT builds on the Residual Hybrid Attention Group (RHAG) paradigm with several key components:
+> [!IMPORTANT]
+> The current architecture expects the matching traiNNer integration, including `traiNNer.ops.drft_ocab_flex` for the compiled OCAB training path. Copying this file into an older stock traiNNer checkout without its companion runtime changes is not a complete installation.
 
-- **Rank-Factored Neural Bias** — Flash-compatible position bias via Q/K concatenation with learned low-rank factors, avoiding the full N×N bias matrix while remaining compatible with SDPA/FlashAttention backends.
-- **Attention-Convolution Transformer (ACT) Blocks** — Each block combines window self-attention (with rank-factored bias), ECB reparameterizable convolution with ECA channel attention, and Conv-SwiGLU FFN with depthwise locality injection.
-- **i-LN (Image Restoration Tailored Layer Normalization)** — Spatially holistic normalization with input-adaptive rescaling from ["Analyzing the Training Dynamics of Image Restoration Transformers"](https://openreview.net/forum?id=owziuM1nsR) (ICLR 2026). Applied to early stages for stable training.
-- **Dense Skip Connections** — DRCT-style dense fusion within each RHAG for information preservation across transformer blocks.
-- **Overlapping Cross-Attention (OCAB)** — HAT-style cross-window attention with asymmetric rank-factored bias for direct inter-window information flow.
-- **Pixel Attention Upsampling** — Per-pixel attention weights refine features before PixelShuffle reconstruction.
-- **ECB Reparameterizable Conv** — Multi-branch training (3x3 + 1x1 + identity) for richer training and faster inference.
-- **LayerScale** — Per-channel residual scaling initialized to small values for stable deep network training.
-- **Per-Window Routing** — Shifted window attention splits windows into interior and boundary (masked) groups, avoiding unnecessary masking overhead on windows that don't straddle region boundaries.
+## Current architecture
 
-### Attention Modes
+- **Full i-LN trunk** — every transformer normalization site uses paper-style image-wide i-LN. There is no legacy LayerNorm factory or `use_iln` compatibility switch.
+- **Asymmetric attention width** — shifted local attention and OCAB retain the full trunk width, while unshifted blocks use a smaller physical Q/K/V space where the factory specifies it.
+- **Rank-factored local position bias** — local attention injects learned low-rank query/key factors without materializing a full position-bias matrix during training.
+- **Exact overlapping cross-attention** — a 32x32 query window uses centered 40x40 K/V context by default. This preserves OCAB behavior rather than replacing it with ordinary local attention.
+- **Dense RHAG refinement** — ACT block endpoints are fused within each RHAG, followed by a residual group convolution.
+- **EDBB convolution branch** — an Edge-Enhanced Diverse Branch Block provides multi-branch training and folds to one convolution for inference.
+- **SwiGLU channel attention and FFN** — both global channel recalibration and the convolutional feed-forward path use gated activations.
+- **LayerScale and DropPath** — ACT residual branches use LayerScale; DRFT-XL additionally enables RHAG-level LayerScale by default.
+- **Compile-aware training graph** — the model advertises a full-graph, static-shape compile contract and a configuration-derived persistent-cache identity.
+- **Deployment-aware export** — the canonical export path folds reparameterizable branches, captures static bias factors, uses the Q4R gather-free shifted-window split, and supports an admitted FP32/BF16/FP16 TensorRT layout.
 
-DRFT supports two attention modes for shifted window masking:
+## Model factories
 
-| Mode | Boundary Windows | Requirements | Use Case |
-|------|-----------------|--------------|----------|
-| `masked` (default) | SDPA with dense attn_mask | PyTorch >= 2.0 | Portable, works everywhere |
-| `hybrid` | Flex Attention with BlockMask | Triton + Linux | Maximum throughput on Linux |
+All standard factories use `rank=32` and full i-LN with `iln_eps=1e-4` by default.
 
-In both modes, **interior windows** (no cross-region contamination) always use Flash with zero overhead. Only boundary windows (last row/col of the shifted grid) need masking.
+| Factory | Width | RHAGs | Blocks per RHAG | Full heads | Unshifted heads | Unshifted Q/K/V width | Window / OCAB span | Dense skip | Reconstruction |
+|---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
+| `drft_nano` | 32 | 1 | 2 | 1 | 1 | 16 | 16 / 20 | No | Direct |
+| `drft_micro` | 64 | 1 | 6 | 2 | 1 | 32 | 32 / 40 | Yes | Progressive |
+| `drft_light` | 96 | 2 | 6 | 3 | 1 | 48 | 32 / 40 | Yes | Progressive |
+| `drft_xs` | 128 | 4 | 6 | 4 | 2 | 64 | 32 / 40 | Yes | Progressive |
+| `drft_s` | 160 | 6 | 6 | 5 | 3 | 96 | 32 / 40 | Yes | Progressive |
+| `drft_m` | 192 | 8 | 6 | 6 | 3 | 96 | 32 / 40 | Yes | Progressive |
+| `drft_l` | 224 | 10 | 6 | 7 | 4 | 128 | 32 / 40 | Yes | Progressive |
+| `drft_xl` | 256 | 14 | 6 | 8 | 4 | 128 | 32 / 40 | Yes | Progressive |
 
-## Benchmark Results (x4 SR)
+DRFT-XL defaults to `rhag_layer_scale_init=1e-4`. The same option can be passed explicitly to another factory when RHAG-level residual scaling is wanted.
 
-DRFT-L with 761K iterations:
+### Teacher factories
 
-| Method | Urban100 PSNR | Urban100 SSIM | Manga109 PSNR | Manga109 SSIM |
-|--------|:-:|:-:|:-:|:-:|
-| SwinIR | 27.45 | 0.8254 | 32.03 | 0.9260 |
-| DAT | 27.87 | 0.8343 | 32.51 | 0.9291 |
-| HAT-L | 28.60 | 0.8498 | 33.09 | 0.9335 |
-| HAT-L* | 28.93 | 0.8562 | 33.28 | 0.9348 |
-| DRCT-L | 28.70 | 0.8508 | 33.14 | 0.9347 |
-| **DRFT-L*** | **29.31** | **0.8631** | **33.37** | **0.9357** |
+Every student has a width-compatible teacher factory:
 
-\* Trained on the same enhanced dataset.
+`drft_nano_teacher`, `drft_micro_teacher`, `drft_light_teacher`, `drft_xs_teacher`, `drft_s_teacher`, `drft_m_teacher`, `drft_l_teacher`, and `drft_xl_teacher`.
 
-> Training concluded at 761K iteration.
+The teachers preserve the student's width and reconstruction topology, increase refinement depth through additional RHAGs, and use full-width unshifted attention. `distillation_feature_pairs()` exposes proportional RHAG endpoints plus the deep-trunk endpoint for feature distillation.
 
-## Model Variants
+## Attention modes
 
-| Variant | embed_dim | RHAG Layers | Heads | head_dim | Dense Skip |
-|---------|:-:|:-:|:-:|:-:|:-:|
-| DRFT-XS | 128 | 4 | 4 | 32 | Yes |
-| DRFT-S | 160 | 6 | 5 | 32 | Yes |
-| DRFT-M | 192 | 6 | 6 | 32 | Yes |
-| DRFT-L | 192 | 12 | 6 | 32 | Yes |
+| Mode | Shifted interior windows | Shifted boundary windows | Intended use |
+|---|---|---|---|
+| `masked` | PyTorch SDPA / Flash when eligible | Additive masked attention | Portable default |
+| `hybrid` | PyTorch Flash SDPA | FlexAttention and the compiled OCAB training route | Fast compiled Linux training |
 
-All variants use `head_dim=32` and `rank=32` (augmented dim = 64), satisfying FlashAttention alignment constraints and tensor alignment for speed boost.
+`hybrid` requires Linux, Triton, and the matching traiNNer runtime. The mathematical region mask is unchanged; routing only selects the backend used for each compatible path.
 
-### Weight Folding
+## traiNNer configuration
+
+Minimal DRFT-Light generator configuration:
+
+```yaml
+use_amp: true
+amp_bf16: true
+use_channels_last: true
+use_compile: true
+compile_mode: max-autotune
+compile_discriminator: false
+
+network_g:
+  type: drft_light
+  scale: 4
+  window_size: 32
+  rank: 32
+  iln_eps: 1.0e-4
+  drop_path_rate: 0.1
+  use_checkpoint: true
+  use_checkpoint_ocab: false
+  attn_type: hybrid
+
+train:
+  per_image_outlier_guard:
+    enabled: true
+    action: exclude
+    start_iter: 10000
+    max_absolute_error: 10.0
+```
+
+`use_checkpoint` controls ACT checkpointing unless `use_checkpoint_act` overrides it. OCAB checkpointing remains off by default and is controlled independently by `use_checkpoint_ocab`.
+
+The per-image guard is a traiNNer feature, not part of the inference architecture. It rejects pathological samples before their update is accepted and has no deployment cost.
+
+## Inference folding
 
 ```python
-# Fold ECB multi-branch convs into a single 3x3 conv to reduce model size
-# Note: folded weights cannot be used to resume training
 model.eval()
-model.fold_ecb()
+model.fold_reparam_conv()
 ```
 
-### ONNX/TensorRT Export
+Folding converts each EDBB training structure into its equivalent inference convolution. Do not use a folded model to resume ordinary multi-branch training. The ONNX preparation API folds an inference clone automatically, leaving the original training model unchanged.
+
+## ONNX and TensorRT
+
+Prepare the model from the canonical 96x96 NCHW example while keeping H/W symbolic in the portable ONNX:
 
 ```python
-# Enable math-attention fallback for export compatibility
-model.set_export_attention_mode(True)
+deployment = model.prepare_for_onnx_export(
+    (1, 3, 96, 96),
+    precision="tensorrt_mixed",
+    dynamic_spatial=True,
+)
 ```
+
+For DRFT, the dynamic-spatial route uses PyTorch's legacy ONNX exporter. Batch and channels stay fixed; height and width are dynamic. Build a separate fixed-profile TensorRT engine for each actual deployment resolution.
+
+The admitted `tensorrt_mixed` policy is:
+
+- FP32 host input and output
+- BF16 body
+- FP16 upsampler and final convolution
+- zero FP8 unless a separate calibrated quantization workflow is deliberately applied
+
+The portable graph materializes exact OCAB bias so ordinary ONNX runtimes can execute it. When the separately built DRFT TensorRT plugin is available, create the compact plugin graph without modifying the portable source:
+
+```python
+from traiNNer.archs.drft_arch import rewrite_onnx_for_tensorrt_plugins
+
+report = rewrite_onnx_for_tensorrt_plugins(
+    "drft_portable.onnx",
+    "drft_tensorrt_plugin.onnx",
+    strategy="compact_bias",
+)
+```
+
+`compact_bias` keeps TensorRT's native fused attention and expands the exact learned OCAB table at runtime. `fused_attention` is available as a lower-engine-memory fallback.
+
+## Checkpoint compatibility
+
+The current file is a clean, fully i-LN architecture line with revised factories from Nano through XL. Older DRFT checkpoints are not assumed to load strictly: factory widths, RHAG counts, normalization parameters, attention projections, and reconstruction choices may differ. Treat conversion or partial loading as an explicit migration rather than compatibility by default.
+
+## Historical quality reference
+
+The following result belongs to an earlier DRFT-L factory and is retained only as project lineage; it is not presented as a benchmark of the current C224/G10 fully i-LN factory.
+
+| Model | Iterations | Urban100 PSNR | Urban100 SSIM | Manga109 PSNR | Manga109 SSIM |
+|---|---:|---:|---:|---:|---:|
+| Historical DRFT-L* | 761K | 29.31 | 0.8631 | 33.37 | 0.9357 |
+
+\* Trained on the enhanced dataset used by the original comparison.
 
 ## Requirements
 
-- PyTorch >= 2.0
-- CUDA with FlashAttention/SDPA support (recommended)
-- Triton + Linux (optional, for `attn_type='hybrid'` Flex Attention mode)
+- The matching DRFT traiNNer-redux integration
+- PyTorch with SDPA support
+- Linux and Triton for `attn_type: hybrid`
+- `onnx` and NumPy for plugin-graph rewriting
+- TensorRT and the separately built DRFT plugin library for plugin deployment
 
-## TODO
+## Research lineage
 
-- [ ] Upload pretrained model
-- [ ] Upload carefully optimized ONNX (mixed precision)
-- [ ] Gather benchmark data
+DRFT incorporates or builds upon ideas from:
 
-## Credits
+- [HAT: Activating More Pixels in Image Super-Resolution Transformer](https://arxiv.org/abs/2205.04437) — RHAG and OCAB
+- [DRCT](https://arxiv.org/abs/2404.00722) — dense transformer refinement
+- [Analyzing the Training Dynamics of Image Restoration Transformers](https://arxiv.org/abs/2504.06629) — i-LN
+- [FlashBias](https://arxiv.org/abs/2505.12044) — rank-factored attention-bias formulation
+- [SwinIR](https://arxiv.org/abs/2108.10257) — shifted-window image restoration
+- [Squeeze-and-Excitation Networks](https://arxiv.org/abs/1709.01507) — channel recalibration
+- [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) — SwiGLU
+- [Going Deeper with Image Transformers](https://arxiv.org/abs/2103.17239) — LayerScale
+- [Efficient Image Super-Resolution Using Pixel Attention](https://arxiv.org/abs/2010.01073) — pixel attention reconstruction
 
-This architecture builds on ideas and components from the following works:
-
-| Component | Paper | Authors |
-|-----------|-------|---------|
-| RHAG + OCAB | [Activating More Pixels in Image Super-Resolution Transformer](https://arxiv.org/abs/2205.04437) (CVPR 2023) | Xiangyu Chen, Xintao Wang, Jiantao Zhou, Yu Qiao, Chao Dong |
-| Dense Skip Connections | [DRCT: Saving Image Super-Resolution away from Information Bottleneck](https://arxiv.org/abs/2404.00722) | Chih-Chung Hsu, Chia-Ming Lee, Yi-Shiuan Chou |
-| i-LN | [Analyzing the Training Dynamics of Image Restoration Transformers](https://openreview.net/forum?id=owziuM1nsR) (ICLR 2026) | Rui Qin, Ming Sun, Chao Zhou, Bin Wang |
-| Rank-Factored Bias | [FlashBias: Fast Computation of Attention with Bias](https://arxiv.org/abs/2505.12044) (NeurIPS 2025) | Zihao Zheng, Jingze Shi, Hanqiu Chen, Xiangyu Zhang, Zhe Li |
-| Shifted Window Attention | [SwinIR: Image Restoration Using Swin Transformer](https://arxiv.org/abs/2108.10257) (ICCVW 2021) | Jingyun Liang, Jiezhang Cao, Guolei Sun, Kai Zhang, Luc Van Gool, Radu Timofte |
-| ECB Reparameterizable Conv | [Edge-oriented Convolution Block for Real-time Super Resolution](https://github.com/xindongzhang/ECBSR) (ACM MM 2021) | Xindong Zhang, Hui Zeng, Lei Zhang |
-| ECA Channel Attention | [ECA-Net: Efficient Channel Attention](https://arxiv.org/abs/1910.03151) (CVPR 2020) | Qilong Wang, Banggu Wu, Pengfei Zhu, Peihua Li, Wangmeng Zuo, Qinghua Hu |
-| SwiGLU FFN | [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) | Noam Shazeer |
-| LayerScale | [Going Deeper with Image Transformers](https://arxiv.org/abs/2103.17239) (ICCV 2021) | Hugo Touvron, Matthieu Cord, Alexandre Sablayrolles, Gabriel Synnaeve, Herve Jegou |
-| Pixel Attention | [Efficient Image Super-Resolution Using Pixel Attention](https://arxiv.org/abs/2010.01073) (ECCVW 2020) | Hengyuan Zhao, Xiangtao Kong, Jingwen He, Yu Qiao, Chao Dong |
-| Flex Attention | [FlexAttention: The Flexibility of PyTorch with the Performance of FlashAttention](https://pytorch.org/blog/flexattention/) (PyTorch Blog 2024) | PyTorch Team |
-
-Trained with [traiNNer-redux](https://github.com/the-database/traiNNer-redux).
+Training and evaluation use [traiNNer-redux](https://github.com/the-database/traiNNer-redux).
 
 ## License
 
