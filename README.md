@@ -5,20 +5,22 @@ DRFT is a single-image super-resolution transformer designed around image-wide n
 This repository tracks the current `drft_arch.py` from the DRFT traiNNer-redux development tree. The previous standalone implementation is preserved locally as `drft_legacy.bak` and intentionally ignored by Git.
 
 > [!IMPORTANT]
-> The current architecture expects the matching traiNNer integration, including `traiNNer.ops.drft_ocab_flex` for the compiled OCAB training path. Copying this file into an older stock traiNNer checkout without its companion runtime changes is not a complete installation.
+> The current architecture expects the matching traiNNer integration. The TensorRT rewrite and optional compiled OCAB training paths use the companion modules under `traiNNer/archs` and `traiNNer/ops` in this repository. Copying only `drft_arch.py` into an older stock traiNNer checkout is not a complete installation.
+
+`drft_arch.py` and `drt_arch.py` are the generator sources intended for `traiNNer/archs/`. The additional files already retain their destination-relative `traiNNer/archs/` and `traiNNer/ops/` paths.
 
 ## Current architecture
 
-- **Full i-LN trunk** — every transformer normalization site uses paper-style image-wide i-LN. There is no legacy LayerNorm factory or `use_iln` compatibility switch.
-- **Asymmetric attention width** — shifted local attention and OCAB retain the full trunk width, while unshifted blocks use a smaller physical Q/K/V space where the factory specifies it.
+- **Full i-LN trunk** — every transformer normalization site uses paper-style image-wide i-LN with FP32 statistics. Every finite standard deviation is preserved; there is no legacy LayerNorm factory, finite-value guard, or `use_iln` compatibility switch.
+- **Full-width local attention** — shifted and unshifted local-attention blocks both retain the complete trunk width and head count.
 - **Rank-factored local position bias** — local attention injects learned low-rank query/key factors without materializing a full position-bias matrix during training.
-- **Exact overlapping cross-attention** — a 32x32 query window uses centered 40x40 K/V context by default. This preserves OCAB behavior rather than replacing it with ordinary local attention.
+- **Exact overlapping cross-attention** — a 32x32 query window uses the original centered 48x48 K/V context. Nano uses the corresponding 16x16 / 24x24 geometry. This preserves OCAB behavior rather than replacing it with ordinary local attention.
 - **Dense RHAG refinement** — ACT block endpoints are fused within each RHAG, followed by a residual group convolution.
 - **EDBB convolution branch** — an Edge-Enhanced Diverse Branch Block provides multi-branch training and folds to one convolution for inference.
 - **SwiGLU channel attention and FFN** — both global channel recalibration and the convolutional feed-forward path use gated activations.
 - **LayerScale and DropPath** — ACT residual branches use LayerScale; DRFT-XL additionally enables RHAG-level LayerScale by default.
-- **Compile-aware training graph** — the model advertises a full-graph, static-shape compile contract and a configuration-derived persistent-cache identity.
-- **Deployment-aware export** — the canonical export path folds reparameterizable branches, captures static bias factors, uses the Q4R gather-free shifted-window split, and supports an admitted FP32/BF16/FP16 TensorRT layout.
+- **Compile-aware training graph** — the model advertises a full-graph, static-shape compile contract, primes immutable caches, and uses selective activation checkpointing to retain attention, QKV, and small normalization reductions while recomputing cheaper work.
+- **Deployment-aware export** — the canonical export path folds reparameterizable branches, captures static bias factors, uses the Q4R gather-free shifted-window split, preserves BF16 attention math, and supports optimized TensorRT graph rewrites.
 
 ## Model factories
 
@@ -26,14 +28,14 @@ All standard factories use `rank=32` and full i-LN with `iln_eps=1e-4` by defaul
 
 | Factory | Width | RHAGs | Blocks per RHAG | Full heads | Unshifted heads | Unshifted Q/K/V width | Window / OCAB span | Dense skip | Reconstruction |
 |---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|
-| `drft_nano` | 32 | 1 | 2 | 1 | 1 | 16 | 16 / 20 | No | Direct |
-| `drft_micro` | 64 | 1 | 6 | 2 | 1 | 32 | 32 / 40 | Yes | Progressive |
-| `drft_light` | 96 | 2 | 6 | 3 | 1 | 48 | 32 / 40 | Yes | Progressive |
-| `drft_xs` | 128 | 4 | 6 | 4 | 2 | 64 | 32 / 40 | Yes | Progressive |
-| `drft_s` | 160 | 6 | 6 | 5 | 3 | 96 | 32 / 40 | Yes | Progressive |
-| `drft_m` | 192 | 8 | 6 | 6 | 3 | 96 | 32 / 40 | Yes | Progressive |
-| `drft_l` | 224 | 10 | 6 | 7 | 4 | 128 | 32 / 40 | Yes | Progressive |
-| `drft_xl` | 256 | 14 | 6 | 8 | 4 | 128 | 32 / 40 | Yes | Progressive |
+| `drft_nano` | 32 | 1 | 2 | 1 | 1 | 32 | 16 / 24 | No | Direct |
+| `drft_micro` | 64 | 1 | 6 | 2 | 2 | 64 | 32 / 48 | Yes | Progressive |
+| `drft_light` | 96 | 2 | 6 | 3 | 3 | 96 | 32 / 48 | Yes | Progressive |
+| `drft_xs` | 128 | 4 | 6 | 4 | 4 | 128 | 32 / 48 | Yes | Progressive |
+| `drft_s` | 160 | 6 | 6 | 5 | 5 | 160 | 32 / 48 | Yes | Progressive |
+| `drft_m` | 192 | 8 | 6 | 6 | 6 | 192 | 32 / 48 | Yes | Progressive |
+| `drft_l` | 224 | 10 | 6 | 7 | 7 | 224 | 32 / 48 | Yes | Progressive |
+| `drft_xl` | 256 | 14 | 6 | 8 | 8 | 256 | 32 / 48 | Yes | Progressive |
 
 DRFT-XL defaults to `rhag_layer_scale_init=1e-4`. The same option can be passed explicitly to another factory when RHAG-level residual scaling is wanted.
 
@@ -43,16 +45,16 @@ Every student has a width-compatible teacher factory:
 
 `drft_nano_teacher`, `drft_micro_teacher`, `drft_light_teacher`, `drft_xs_teacher`, `drft_s_teacher`, `drft_m_teacher`, `drft_l_teacher`, and `drft_xl_teacher`.
 
-The teachers preserve the student's width and reconstruction topology, increase refinement depth through additional RHAGs, and use full-width unshifted attention. `distillation_feature_pairs()` exposes proportional RHAG endpoints plus the deep-trunk endpoint for feature distillation.
+The teachers preserve the student's width and reconstruction topology and increase refinement depth through additional RHAGs. They inherit the same full-width local attention and original OCAB overlap as every canonical student. `distillation_feature_pairs()` exposes proportional RHAG endpoints plus the deep-trunk endpoint for feature distillation.
 
 ## Attention modes
 
 | Mode | Shifted interior windows | Shifted boundary windows | Intended use |
 |---|---|---|---|
 | `masked` | PyTorch SDPA / Flash when eligible | Additive masked attention | Portable default |
-| `hybrid` | PyTorch Flash SDPA | FlexAttention and the compiled OCAB training route | Fast compiled Linux training |
+| `hybrid` | PyTorch Flash SDPA | FlexAttention | Fast compiled Linux training |
 
-`hybrid` requires Linux, Triton, and the matching traiNNer runtime. The mathematical region mask is unchanged; routing only selects the backend used for each compatible path.
+`hybrid` requires Linux, Triton, and the matching traiNNer runtime. The mathematical shifted-window region mask is unchanged; routing only selects the backend used for each compatible path. OCAB remains exact dense-bias SDPA rather than a score-mod approximation.
 
 ## traiNNer configuration
 
@@ -74,20 +76,10 @@ network_g:
   iln_eps: 1.0e-4
   drop_path_rate: 0.1
   use_checkpoint: true
-  use_checkpoint_ocab: false
   attn_type: hybrid
-
-train:
-  per_image_outlier_guard:
-    enabled: true
-    action: exclude
-    start_iter: 10000
-    max_absolute_error: 10.0
 ```
 
 `use_checkpoint` controls ACT checkpointing unless `use_checkpoint_act` overrides it. OCAB checkpointing remains off by default and is controlled independently by `use_checkpoint_ocab`.
-
-The per-image guard is a traiNNer feature, not part of the inference architecture. It rejects pathological samples before their update is accepted and has no deployment cost.
 
 ## Inference folding
 
@@ -127,15 +119,37 @@ from traiNNer.archs.drft_arch import rewrite_onnx_for_tensorrt_plugins
 report = rewrite_onnx_for_tensorrt_plugins(
     "drft_portable.onnx",
     "drft_tensorrt_plugin.onnx",
-    strategy="compact_bias",
 )
 ```
 
-`compact_bias` keeps TensorRT's native fused attention and expands the exact learned OCAB table at runtime. `fused_attention` is available as a lower-engine-memory fallback.
+The default `optimized` strategy keeps compact exact OCAB bias while additionally decomposing dense fusion, fusing ImageLayerNorm, and packing OCAB QKV in token-major order. `compact_bias` performs only the compact-bias rewrite, while `fused_attention` remains available as a lower-engine-memory fallback.
 
 ## Checkpoint compatibility
 
-The current file is a clean, fully i-LN architecture line with revised factories from Nano through XL. Older DRFT checkpoints are not assumed to load strictly: factory widths, RHAG counts, normalization parameters, attention projections, and reconstruction choices may differ. Treat conversion or partial loading as an explicit migration rather than compatibility by default.
+The current files define clean, fully i-LN architecture lines. DRT has no LayerNorm compatibility mode or `use_iln=False` path. Older checkpoints are not assumed to load strictly: factory widths, RHAG counts, normalization parameters, attention projections, and reconstruction choices may differ. Treat conversion or partial loading as an explicit migration rather than compatibility by default.
+
+### DRT in chaiNNer
+
+`tools/patch_spandrel_drft.py` installs DRFT, Dense Rotary Transformer (DRT), and ESCRIB support into the Spandrel runtime owned by the Python executable used to run it. The patcher keeps its existing backup, verification, and cross-version registry discovery behavior.
+
+DRFT-Next and DRT use identical learned tensor paths. DRT checkpoints carry two small persistent metadata tensors so Spandrel can distinguish the architecture and recover its window and numerical settings. Convert an existing DRFT-Next checkpoint without changing any learned tensor or topology:
+
+```powershell
+python tools\convert_drft_next_to_drt.py INPUT.safetensors OUTPUT.safetensors
+```
+
+The default geometry is a 32x32 attention window with a 48x48 OCAB span. Use `--window-size` and `--overlap-window-size` only for a checkpoint trained with different geometry. Conversion does not resize a preset: for example, a converted DRFT-Next XS retains its original width and group count rather than becoming the new DRT XS factory.
+
+The canonical DRT model zoo uses the original depth-oriented geometry:
+
+| Factory | Width | RHAGs | Heads |
+|---|---:|---:|---:|
+| `drt_light` | 96 | 2 | 3 |
+| `drt_xs` | 128 | 4 | 4 |
+| `drt_s` | 160 | 6 | 5 |
+| `drt_m` | 192 | 8 | 6 |
+| `drt_l` | 224 | 10 | 7 |
+| `drt_xl` | 256 | 14 | 8 |
 
 ## Historical quality reference
 
@@ -149,7 +163,7 @@ The following result belongs to an earlier DRFT-L factory and is retained only a
 
 ## Requirements
 
-- The matching DRFT traiNNer-redux integration
+- The matching DRFT/DRT traiNNer-redux integration and companion modules included here
 - PyTorch with SDPA support
 - Linux and Triton for `attn_type: hybrid`
 - `onnx` and NumPy for plugin-graph rewriting

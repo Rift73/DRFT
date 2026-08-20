@@ -1,1 +1,6 @@
 drft_legacy.bak
+__pycache__/
+*.py[cod]
+graphify-out/
+.pytest_cache/
+.ruff_cache/
