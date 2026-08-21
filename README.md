@@ -130,7 +130,7 @@ The current files define clean, fully i-LN architecture lines. DRT has no LayerN
 
 ### DRT in chaiNNer
 
-`tools/patch_spandrel_drft.py` installs DRFT, Dense Rotary Transformer (DRT), and ESCRIB support into the Spandrel runtime owned by the Python executable used to run it. The patcher keeps its existing backup, verification, and cross-version registry discovery behavior.
+`tools/patch_spandrel_drft.py` installs DRFT, Dense Rotary Transformer (DRT) support into the Spandrel runtime owned by the Python executable used to run it. The patcher keeps its existing backup, verification, and cross-version registry discovery behavior.
 
 DRFT-Next and DRT use identical learned tensor paths. DRT checkpoints carry two small persistent metadata tensors so Spandrel can distinguish the architecture and recover its window and numerical settings. Convert an existing DRFT-Next checkpoint without changing any learned tensor or topology:
 
